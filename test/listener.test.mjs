@@ -6,7 +6,7 @@ const require = createRequire(import.meta.url);
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { answerOne, claudeArgs, install, messageOutbox, replyText, run, runClaude, shortName, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
+import { answerOne, claudeArgs, install, listenerDir, messageFolder, replyText, run, runClaude, shortName, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
 import { readCredentials } from "../scripts/lib/credentials.mjs";
@@ -56,12 +56,12 @@ function fakeClaude(reply, { bytes = false } = {}) {
 
 const message = (id, text, conversation = "web:c1") => ({ id, conversation, platform: "web", sender: "Asha", text, context: [], memories: ["Asha ships on Fridays."], attachments: [] });
 
-/** The outbox a fake claude was allowed to write to (from its Edit rule), as a full path. */
-const outboxOf = (args, cwd) => join(cwd, /^Edit\(\.\/(.+)\/\*\*\)$/.exec(args.find(a => a.startsWith("Edit(")))[1]);
+/** The outbox a fake claude was allowed to write to (from its Edit rule: "//" + a full path). */
+const outboxOf = args => /^Edit\(\/(\/.+)\/\*\*\)$/.exec(args.find(a => a.startsWith("Edit(")))[1];
 
-test("claude runs with only Mnemio's tools, skills, reading its own folder and writing its message's outbox", () => {
-  assert.deepEqual(claudeArgs({ dir: "/w", sessionId: "s1", outbox: "outbox/m1" }), ["-p", "--output-format", "stream-json", "--verbose", "--resume", "s1", "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", "Read(./**)", "Edit(./outbox/m1/**)"]);
-  assert.ok(!claudeArgs({ dir: "/w" }).includes("--resume"));
+test("claude runs with only Mnemio's tools, skills, reading this message's folder and writing its outbox", () => {
+  assert.deepEqual(claudeArgs({ sessionId: "s1", folder: "/c/messages/m1", outbox: "/c/messages/m1/outbox" }), ["-p", "--output-format", "stream-json", "--verbose", "--resume", "s1", "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", "Read(//c/messages/m1/**)", "Edit(//c/messages/m1/outbox/**)"]);
+  assert.ok(!claudeArgs({ folder: "/f", outbox: "/f/outbox" }).includes("--resume"));
 });
 
 test("runClaude reads Claude's JSON result, and reports its errors", async () => {
@@ -227,12 +227,18 @@ test("reports each step to Mnemio as it happens, then sends the answer with the 
   const fs = require("node:fs");
   const id = "7d0c8a5e-0000-4000-8000-0000000000a1";
   // Left over from an earlier run of this message that crashed: never sent with this answer.
-  fs.mkdirSync(join(workDir(env), "outbox", id), { recursive: true });
-  fs.writeFileSync(join(workDir(env), "outbox", id, "old.txt"), "stale");
+  fs.mkdirSync(join(listenerDir(env), "messages", id, "outbox"), { recursive: true });
+  fs.writeFileSync(join(listenerDir(env), "messages", id, "outbox", "old.txt"), "stale");
+  // What earlier versions left in the working folder (every message's files): removed, so nothing can read them.
+  fs.mkdirSync(join(workDir(env), "inbox", "7d0c8a5e-0000-4000-8000-0000000000a0"), { recursive: true });
+  fs.writeFileSync(join(workDir(env), "inbox", "7d0c8a5e-0000-4000-8000-0000000000a0", "other.pdf"), "someone else's");
   const long = "q".repeat(230) + ".xlsx";
   const claude = fakeClaude((args, input, cwd) => {
-    const box = outboxOf(args, cwd);
-    assert.equal(box, join(cwd, "outbox", id), "this message's own outbox");
+    const box = outboxOf(args);
+    assert.equal(box, join(listenerDir(env), "messages", id, "outbox"), "this message's own outbox");
+    assert.ok(args.includes(`Read(/${join(listenerDir(env), "messages", id)}/**)`), "reading only this message's folder");
+    assert.ok(!args.some(a => a.startsWith("Read(./")), "not the working folder");
+    assert.ok(!fs.existsSync(join(cwd, "inbox")), "earlier versions' files are gone");
     assert.ok(!fs.existsSync(join(box, "old.txt")), "the outbox starts empty");
     fs.writeFileSync(join(box, "report.csv"), "a,b\n1,2\n");
     fs.mkdirSync(join(box, "charts"));
@@ -246,7 +252,7 @@ test("reports each step to Mnemio as it happens, then sends the answer with the 
     return [toolUse("t0", "ToolSearch", { query: "goals" }), toolResult("t0"), toolUse("t1", "mcp__plugin_mnemio_mnemio__list_goals", {}), toolResult("t1"), toolUse("t2", "Write", { file_path: join(box, "report.csv") }), toolResult("t2"), success("Here's the report.")];
   });
   const text = await answerOne(message(id, "Make me a report"), { env, request, spawnFn: claude.spawnFn });
-  assert.ok(claude.calls[0].input.includes(`write it into ./outbox/${id}/ in your working folder`));
+  assert.ok(claude.calls[0].input.includes(`write it into ${join(listenerDir(env), "messages", id, "outbox")}/`));
   assert.deepEqual(calls.map(c => c.path), [...Array(4).fill(`/api/claude/inbox/${id}/progress`), `/api/claude/inbox/${id}/reply`], "steps first, in order, then the answer");
   assert.deepEqual(calls.slice(0, 4).map(c => c.body), [
     { step: "t1", tool: "Checking goals", preview: "", state: "started" },
@@ -260,7 +266,7 @@ test("reports each step to Mnemio as it happens, then sends the answer with the 
   assert.ok(reply.files.every(f => f.name.length <= 120), "names the reply API takes");
   assert.equal(Buffer.from(reply.files[2].data, "base64").toString(), "a,b\n1,2\n");
   assert.match(text, /^Here's the report\.[\s\S]*Not sent: a\/b\/c\/d\/e\/f\/g\/ \(folders nested too deep\), big\.bin\./, "files left out are named, deep folders too");
-  assert.ok(!fs.existsSync(join(workDir(env), "outbox", id)), "removed after sending");
+  assert.ok(!fs.existsSync(join(listenerDir(env), "messages", id)), "the message's folder is removed after sending");
 });
 
 test("one message's files never go out with another conversation's answer, even when the first one failed", async t => {
@@ -271,7 +277,7 @@ test("one message's files never go out with another conversation's answer, even 
   const claude = fakeClaude((args, input, cwd) => {
     n++;
     if (n === 1) {
-      fs.writeFileSync(join(outboxOf(args, cwd), "private.txt"), "for Asha only");
+      fs.writeFileSync(join(outboxOf(args), "private.txt"), "for Asha only");
       return { type: "result", subtype: "error_during_execution", is_error: true, result: "Crashed" };
     }
     return success("Hello.");
@@ -283,20 +289,35 @@ test("one message's files never go out with another conversation's answer, even 
   assert.deepEqual(replies[0].body, { text: "Hello." }, "no files");
 });
 
-test("two listeners answering at once keep their outboxes apart; one left behind long ago is cleared", async t => {
+test("two listeners answering at once keep their messages' folders apart; one left behind long ago is cleared", async t => {
   const env = await home(t);
   const fs = require("node:fs");
-  const dir = workDir(env);
-  const a = messageOutbox(dir, "7d0c8a5e-0000-4000-8000-0000000000d1");
-  fs.writeFileSync(join(a.path, "mine.txt"), "A's");
-  const old = join(dir, "outbox", "7d0c8a5e-0000-4000-8000-0000000000d0");
+  const dir = listenerDir(env);
+  const a = messageFolder(dir, "7d0c8a5e-0000-4000-8000-0000000000d1");
+  fs.writeFileSync(join(a.outbox, "mine.txt"), "A's");
+  const old = join(dir, "messages", "7d0c8a5e-0000-4000-8000-0000000000d0");
   fs.mkdirSync(old);
   fs.utimesSync(old, new Date(Date.now() - 2 * 3_600_000), new Date(Date.now() - 2 * 3_600_000));
-  const b = messageOutbox(dir, "7d0c8a5e-0000-4000-8000-0000000000d2");
-  assert.notEqual(a.path, b.path);
-  assert.equal(fs.readFileSync(join(a.path, "mine.txt"), "utf8"), "A's", "another message's outbox in use is left alone");
+  const b = messageFolder(dir, "7d0c8a5e-0000-4000-8000-0000000000d2");
+  assert.notEqual(a.base, b.base);
+  assert.ok(!b.base.startsWith(workDir(env)), "outside the folder Claude works in");
+  assert.equal(fs.readFileSync(join(a.outbox, "mine.txt"), "utf8"), "A's", "another message's folder in use is left alone");
   assert.ok(!fs.existsSync(old), "an abandoned one is cleared");
-  assert.throws(() => messageOutbox(dir, "../escape"), /invalid message id/);
+  assert.throws(() => messageFolder(dir, "../escape"), /invalid message id/);
+});
+
+test("a messages folder that is a link is removed, never followed and cleared", async t => {
+  const env = await home(t);
+  const fs = require("node:fs");
+  const dir = listenerDir(env);
+  const elsewhere = join(env.MNEMIO_CONFIG_DIR, "elsewhere");
+  fs.mkdirSync(join(elsewhere, "keep"), { recursive: true });
+  fs.utimesSync(join(elsewhere, "keep"), new Date(0), new Date(0));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.symlinkSync(elsewhere, join(dir, "messages"));
+  messageFolder(dir, "7d0c8a5e-0000-4000-8000-0000000000d3");
+  assert.ok(fs.existsSync(join(elsewhere, "keep")), "what the link pointed at is untouched");
+  assert.ok(!fs.lstatSync(join(dir, "messages")).isSymbolicLink());
 });
 
 test("the reply always fits the reply API: a long answer is cut, and the note about files left out is bounded", () => {
@@ -307,6 +328,13 @@ test("the reply always fits the reply API: a long answer is cut, and the note ab
   assert.equal(huge.length <= 30_000, true);
   assert.match(huge, /Cut short[\s\S]*Not sent: a\.bin/);
   assert.equal(shortName("short.pdf"), "short.pdf");
+  // Cut inside a code block: it's closed, so what follows (and the file links Mnemio adds) isn't shown as code.
+  const code = replyText("Here:\n```\n" + "line\n".repeat(8_000), []);
+  assert.ok(code.length <= 30_000);
+  assert.match(code, /\n```\n\n_\(Cut short/);
+  // Never half of a character (an emoji is two UTF-16 units).
+  assert.doesNotMatch(shortName("😀".repeat(80) + ".png"), /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  assert.doesNotMatch(replyText("x" + "😀".repeat(20_000)), /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
 });
 
 test("Claude's raw output never reaches the chat when it stops without an answer", async () => {
@@ -355,6 +383,7 @@ test("step reports still on their way when the answer is ready hold it up briefl
   const started = Date.now();
   await steps.flush();
   assert.ok(Date.now() - started < 1_000, "the answer doesn't wait for a slow report");
+  assert.deepEqual(steps.unconfirmed(), [{ step: "t1", state: "done" }], "how it ended goes with the answer instead");
   release();
   await new Promise(r => setTimeout(r, 20));
   assert.equal(posted.length, 1, "the queued report is dropped once the answer went");
@@ -370,5 +399,5 @@ test("a step report that fails never holds the answer up", async t => {
   };
   const claude = fakeClaude(() => [toolUse("t1", "Read", { file_path: "/w/inbox/a.pdf" }), toolResult("t1"), success("Read it.")]);
   assert.equal(await answerOne(message("7d0c8a5e-0000-4000-8000-0000000000c1", "Summarise"), { env, request, spawnFn: claude.spawnFn }), "Read it.");
-  assert.deepEqual(sent, [{ text: "Read it." }]);
+  assert.deepEqual(sent, [{ text: "Read it.", steps: [{ step: "t1", state: "done" }] }], "the step's end goes with the answer instead");
 });

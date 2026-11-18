@@ -12,11 +12,11 @@ export const inboxDir = (env = process.env) => join(env.CLAUDE_PLUGIN_DATA || tm
 
 const safeName = name => String(name).replace(/[/\\\0]/g, "_").replace(/^\.+/, "").trim().slice(0, 120) || "file";
 
-/** Downloads a collected message's attachments; returns their local paths, in order. */
-export async function downloadAttachments(message, { env = process.env, request = fetch, dir = inboxDir(env) } = {}) {
+/** Downloads a collected message's attachments (into `folder`, by default <dir>/<message id>); returns their local paths, in order. */
+export async function downloadAttachments(message, { env = process.env, request = fetch, dir = inboxDir(env), folder } = {}) {
   if (!message.attachments?.length) return [];
   if (!/^[0-9a-f-]{36}$/.test(message.id)) throw new Error("Mnemio sent an invalid message id.");
-  const folder = join(dir, message.id);
+  folder ??= join(dir, message.id);
   await mkdir(folder, { recursive: true, mode: 0o700 });
   const paths = [];
   const used = new Set();
