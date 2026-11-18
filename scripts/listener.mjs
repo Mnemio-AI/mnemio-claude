@@ -2,7 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 import { callMnemio, isConnected } from "./lib/http.mjs";
@@ -68,10 +68,26 @@ const TOOLS = "Read,Edit,Write,Skill,ToolSearch";
 
 /**
  * Mnemio's tools, and no other MCP server: the plugin's own server (channel.mjs), started directly, so the person's
- * other servers and claude.ai connectors (their Drive, a design tool, …) are never in reach of a message.
+ * other servers and claude.ai connectors (their Drive, a design tool, …) are never in reach of a message. It keeps
+ * the plugin's server name, so its tools keep their names (mcp__plugin_mnemio_mnemio__…) and any deny or ask rule the
+ * person or their company set for them still applies. The sign-in is passed by reference, as the plugin's .mcp.json
+ * does: Claude Code fills it in, so the token is never on a command line.
  */
-export const mcpConfig = (node = process.execPath) =>
-  JSON.stringify({ mcpServers: { mnemio: { command: node, args: [new URL("./channel.mjs", import.meta.url).pathname], env: { MNEMIO_CHANNEL: "" } } } });
+export const mcpConfig = (node = process.execPath, script = fileURLToPath(new URL("./channel.mjs", import.meta.url))) =>
+  JSON.stringify({
+    mcpServers: {
+      plugin_mnemio_mnemio: { command: node, args: [script], env: { MNEMIO_CHANNEL: "", MNEMIO_URL: "${MNEMIO_URL:-}", MNEMIO_TOKEN: "${MNEMIO_TOKEN:-}" } }
+    }
+  });
+
+/**
+ * Where a company's Claude Code management puts the MCP servers it allows on a computer. With it, Claude Code won't
+ * take the listener's own server set, so the listener can't keep Claude to Mnemio's tools: it doesn't answer there.
+ */
+export const managedMcpPaths = () =>
+  process.platform === "darwin" ? ["/Library/Application Support/ClaudeCode/managed-mcp.json"]
+    : process.platform === "win32" ? ["C:\\ProgramData\\ClaudeCode\\managed-mcp.json"]
+    : ["/etc/claude-code/managed-mcp.json"];
 
 /**
  * The arguments for one `claude -p` answer. `folder` is this message's folder and `outbox` its outbox (full paths):
@@ -79,7 +95,8 @@ export const mcpConfig = (node = process.execPath) =>
  * Writing is granted with an Edit rule (it covers Write too; a Write(...) rule grants nothing).
  *
  * What it can do doesn't depend on the person's own Claude Code settings: `--tools` leaves out the shell, the web and
- * everything else even if their settings allow them, and `--strict-mcp-config` loads only Mnemio's server.
+ * everything else even if their settings allow them, `--strict-mcp-config` loads only Mnemio's server, and
+ * `--no-chrome` keeps the browser out even where Claude in Chrome is on.
  */
 export function claudeArgs({ sessionId, folder, outbox, extra = [], mcp = mcpConfig() }) {
   return [
@@ -87,8 +104,8 @@ export function claudeArgs({ sessionId, folder, outbox, extra = [], mcp = mcpCon
     "-p", "--output-format", "stream-json", "--verbose",
     ...(sessionId ? ["--resume", sessionId] : []),
     "--tools", TOOLS,
-    "--strict-mcp-config", "--mcp-config", mcp,
-    "--allowedTools", "mcp__mnemio", "Skill", `Read(/${folder}/**)`, `Edit(/${outbox}/**)`,
+    "--strict-mcp-config", "--mcp-config", mcp, "--no-chrome",
+    "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", `Read(/${folder}/**)`, `Edit(/${outbox}/**)`,
     ...extra
   ];
 }
@@ -167,6 +184,11 @@ export function stepReporter(m, { env = process.env, request = fetch, flushMs = 
   const ids = new Map();
   /** Steps started and not ended yet: if Claude stops, they were cut off. */
   const running = new Set();
+  /** Claude stopped: the steps it left running were cut off, so they ended as failed. */
+  const interrupt = () => {
+    for (const step of running) ends.set(step, "failed");
+    running.clear();
+  };
   /** Step id → how it ended, until Mnemio confirmed that report. */
   const ends = new Map();
   let chain = Promise.resolve();
@@ -182,6 +204,8 @@ export function stepReporter(m, { env = process.env, request = fetch, flushMs = 
   };
   return {
     onTool(e) {
+      // A step needs Claude's id for it: without one its end can't be matched, so it isn't shown at all.
+      if (!e.id) return;
       if (e.state === "started") {
         const step = describeStep(e.name, e.input);
         if (!step) return;
@@ -199,8 +223,9 @@ export function stepReporter(m, { env = process.env, request = fetch, flushMs = 
      * At most 100 (what Mnemio keeps), failed ones first: those must never show as done. `interrupted`: Claude
      * stopped, so steps still running were cut off — they count as failed.
      */
+    interrupt,
     unconfirmed: ({ interrupted = false } = {}) =>
-      [...ends, ...(interrupted ? [...running].map(step => [step, "failed"]) : [])]
+      (interrupted && interrupt(), [...ends])
         .map(([step, state]) => ({ step, state }))
         .sort((a, b) => (a.state === "failed" ? 0 : 1) - (b.state === "failed" ? 0 : 1))
         .slice(0, 100),
@@ -353,10 +378,11 @@ export function replyText(answer, skipped = []) {
 /** Answers one collected message; returns what was sent. */
 export async function answerOne(m, { env = process.env, request = fetch, spawnFn = spawn, settings = listenerSettings(env) } = {}) {
   const dir = workDir(env);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Claude may read its working folder: it must be a real, private folder of the listener's. A link there (to an
+  // older workspace, say) is removed, never followed, and never cleared through.
+  realDir(dir);
   // Earlier versions kept every message's files in the working folder (inbox/, outbox/): gone, so none stay readable.
-  // Only in a real folder: a workspace that's a link points somewhere this mustn't clear.
-  if (!lstatSync(dir).isSymbolicLink()) for (const old of ["inbox", "outbox"]) rmSync(join(dir, old), { recursive: true, force: true });
+  for (const old of ["inbox", "outbox"]) rmSync(join(dir, old), { recursive: true, force: true });
   let box = messageFolder(listenerDir(env), m.id);
   let steps;
   try {
@@ -372,6 +398,8 @@ export async function answerOne(m, { env = process.env, request = fetch, spawnFn
     } catch (e) {
       // A conversation's session can be gone (cleaned up, another computer): start a fresh one, with Mnemio's context.
       if (!sessions[key]) throw e;
+      // The first attempt's unfinished steps were cut off: they go with the answer as failed, whatever the retry does.
+      steps.interrupt();
       rmSync(box.outbox, { recursive: true, force: true });
       mkdirSync(box.outbox, { mode: 0o700 });
       result = await run(undefined);
@@ -407,12 +435,21 @@ export function listenerSettings(env = process.env) {
 }
 
 /** The loop the service runs: collect, answer, repeat. */
-export async function run({ env = process.env, request = fetch, spawnFn = spawn, sleep = ms => new Promise(r => setTimeout(r, ms)), once = false } = {}) {
+export async function run({ env = process.env, request = fetch, spawnFn = spawn, sleep = ms => new Promise(r => setTimeout(r, ms)), once = false, managedPaths = managedMcpPaths() } = {}) {
   const state = { pid: process.pid, startedAt: new Date().toISOString(), answered: 0, lastPollAt: null, lastError: null };
   const save = () => writeJson(statePath(env), state);
   save();
   let backoff = 2000;
   for (;;) {
+    // Checked before taking any message: one taken here couldn't be answered.
+    const managed = managedPaths.find(p => existsSync(p));
+    if (managed) {
+      state.lastError = `Your company manages Claude Code's MCP servers on this computer (${managed}), so the listener can't keep your Claude to Mnemio's tools here. Use cloud mode in Mnemio → Settings → Claude, or ask your admin.`;
+      save();
+      if (once) return state;
+      await sleep(10 * 60_000);
+      continue;
+    }
     if (!isConnected(env)) {
       state.lastError = "Not connected to Mnemio: run /mnemio:connect in Claude Code.";
       save();

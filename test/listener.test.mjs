@@ -60,12 +60,17 @@ const message = (id, text, conversation = "web:c1") => ({ id, conversation, plat
 const outboxOf = args => /^Edit\(\/(\/.+)\/\*\*\)$/.exec(args.find(a => a.startsWith("Edit(")))[1];
 
 test("claude runs with only Mnemio's tools, skills, reading this message's folder and writing its outbox", () => {
-  assert.deepEqual(claudeArgs({ sessionId: "s1", folder: "/c/messages/m1", outbox: "/c/messages/m1/outbox", mcp: "{}" }), ["-p", "--output-format", "stream-json", "--verbose", "--resume", "s1", "--tools", "Read,Edit,Write,Skill,ToolSearch", "--strict-mcp-config", "--mcp-config", "{}", "--allowedTools", "mcp__mnemio", "Skill", "Read(//c/messages/m1/**)", "Edit(//c/messages/m1/outbox/**)"]);
-  // Only Mnemio's own server, started from this plugin.
+  assert.deepEqual(claudeArgs({ sessionId: "s1", folder: "/c/messages/m1", outbox: "/c/messages/m1/outbox", mcp: "{}" }), ["-p", "--output-format", "stream-json", "--verbose", "--resume", "s1", "--tools", "Read,Edit,Write,Skill,ToolSearch", "--strict-mcp-config", "--mcp-config", "{}", "--no-chrome", "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", "Read(//c/messages/m1/**)", "Edit(//c/messages/m1/outbox/**)"]);
+  // Only Mnemio's own server, started from this plugin, under the plugin's server name (so its tools keep their
+  // names and any deny rule for them applies), with the sign-in by reference, never on the command line.
   const servers = JSON.parse(mcpConfig("/usr/bin/node")).mcpServers;
-  assert.deepEqual(Object.keys(servers), ["mnemio"]);
-  assert.equal(servers.mnemio.command, "/usr/bin/node");
-  assert.match(servers.mnemio.args[0], /scripts\/channel\.mjs$/);
+  assert.deepEqual(Object.keys(servers), ["plugin_mnemio_mnemio"]);
+  assert.equal(servers.plugin_mnemio_mnemio.command, "/usr/bin/node");
+  assert.match(servers.plugin_mnemio_mnemio.args[0], /scripts\/channel\.mjs$/);
+  assert.deepEqual(servers.plugin_mnemio_mnemio.env, { MNEMIO_CHANNEL: "", MNEMIO_URL: "${MNEMIO_URL:-}", MNEMIO_TOKEN: "${MNEMIO_TOKEN:-}" });
+  // A plugin installed under a folder with spaces: a real path, not a percent-encoded URL.
+  assert.equal(JSON.parse(mcpConfig("/n", "/Users/a b/plugins/mnemio/scripts/channel.mjs")).mcpServers.plugin_mnemio_mnemio.args[0], "/Users/a b/plugins/mnemio/scripts/channel.mjs");
+  assert.doesNotMatch(JSON.parse(mcpConfig()).mcpServers.plugin_mnemio_mnemio.args[0], /%[0-9A-F]{2}/);
   assert.ok(!claudeArgs({ folder: "/f", outbox: "/f/outbox" }).includes("--resume"));
 });
 
@@ -479,4 +484,28 @@ test("a workspace that is a link isn't cleared through it", async t => {
   const { request } = recorder();
   await answerOne(message("7d0c8a5e-0000-4000-8000-0000000000eb", "Hi"), { env, request, spawnFn: fakeClaude(() => success("Hello.")).spawnFn });
   assert.ok(fs.existsSync(join(elsewhere, "inbox", "keep.txt")));
+});
+
+test("where the company manages Claude Code's MCP servers, the listener takes no message it couldn't answer safely", async t => {
+  const env = await home(t);
+  const managed = join(env.MNEMIO_CONFIG_DIR, "managed-mcp.json");
+  require("node:fs").writeFileSync(managed, "{}");
+  const request = async () => assert.fail("no message is collected");
+  const state = await run({ env, request, once: true, managedPaths: [managed] });
+  assert.match(state.lastError, /company manages Claude Code's MCP servers/);
+});
+
+test("a first attempt's unfinished steps end as failed even when the retry answers", async t => {
+  const env = await home(t);
+  const { calls, request } = recorder();
+  require("node:fs").mkdirSync(listenerDir(env), { recursive: true });
+  require("node:fs").writeFileSync(join(listenerDir(env), "sessions.json"), JSON.stringify({ "web:c1": "old" }));
+  const claude = fakeClaude(args => args.includes("--resume")
+    ? [toolUse("t1", "mcp__plugin_mnemio_mnemio__list_goals", {})]
+    : [toolUse("", "Read", {}), success("Done.")]);
+  // Step reports go through first, then the answer: t1's end was never reported.
+  await answerOne(message("7d0c8a5e-0000-4000-8000-0000000000ec", "Hi"), { env, request, spawnFn: claude.spawnFn });
+  const answer = calls.find(c => c.path.endsWith("/reply")).body;
+  assert.deepEqual(answer.steps, [{ step: "t1", state: "failed" }]);
+  assert.ok(!calls.some(c => c.path.endsWith("/progress") && c.body.step === ""), "a step without an id isn't reported");
 });
