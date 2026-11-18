@@ -12,15 +12,22 @@ The plugin talks to Mnemio over HTTPS with its own sign-in; it never sees or sen
 
 ## Set up
 
-In Claude Code:
+**In Mnemio → Settings → Claude, press Connect Claude Code** and paste the command it shows into a terminal:
+
+```sh
+curl -fsSL https://your-workspace.mnemio.ai/api/claude/install/<one-time code> | sh
+```
+
+That's all. It installs this plugin, signs this computer in (its own sign-in, saved privately in `~/.config/mnemio/`), switches your Mnemio chats to your Claude, and asks whether your Claude should **answer your chats on this computer in the background** (yes by default). The Settings page turns green when it's done. The code works once, for 10 minutes; fetching the link alone (a chat app's link preview, say) never uses it.
+
+Already in Claude Code? This does the same, approving in the browser instead:
 
 ```
-/plugin marketplace add Mnemio-AI/mnemio-claude
-/plugin install mnemio@mnemio
+/plugin install mnemio --marketplace Mnemio-AI/mnemio-claude
 /mnemio:connect your-workspace.mnemio.ai
 ```
 
-The last one opens your Mnemio workspace in the browser with a short code. Check the code and press **Approve**: this computer gets its own sign-in, saved privately in `~/.config/mnemio/`. Nothing to copy or export. **Mnemio → Settings → Claude** shows the same three lines with copy buttons, every Claude you connected (sign any one out), and what the plugin does:
+**Mnemio → Settings → Claude** lists every Claude you connected (sign any one out) and what the plugin does:
 
 - **What syncs back:** every project, or the ones you add by running `/mnemio:sync-here` inside them.
 - **Company skills installed in Claude Code:** on by default. Every skill you receive in Mnemio (official, shared with you, your assistant's) becomes a Claude Code skill in `~/.claude/skills/mnemio-<name>/`, kept up to date at each session start. Turning it off, or `/mnemio:disconnect`, removes them; the plugin never touches other skill folders.
@@ -28,38 +35,39 @@ The last one opens your Mnemio workspace in the browser with a short code. Check
 | Command | What it does |
 | --- | --- |
 | `/mnemio:connect <workspace>` | Connect this computer (approve in the browser) |
+| `/mnemio:listen on\|off\|status` | Answer your chats on this computer in the background |
 | `/mnemio:status` | Which workspace and account, what syncs |
 | `/mnemio:sync-here` | Sync this project (`/mnemio:sync-here off` to stop) |
 | `/mnemio:disconnect` | Sign this computer out |
 | `/mnemio:brain …` | Ask about company skills and memory |
 
-Requires Node.js 22+.
+Requires Claude Code and Node.js 22+.
 
 ### For companies: nothing for staff to do
 
-On Claude Team or Enterprise, an Owner can install it for everyone in managed settings: add the marketplace with `extraKnownMarketplaces` (`Mnemio-AI/mnemio-claude`), turn the plugin on with `enabledPlugins` (`"mnemio@mnemio": true`), set `MNEMIO_URL` to your workspace under `env` so `/mnemio:connect` needs no address, and allow the channel with `allowedChannelPlugins`. Each person then runs `/mnemio:connect` once.
+On Claude Team or Enterprise, an Owner can install it for everyone in managed settings: add the marketplace with `extraKnownMarketplaces` (`Mnemio-AI/mnemio-claude`), turn the plugin on with `enabledPlugins` (`"mnemio@mnemio": true`), and set `MNEMIO_URL` to your workspace under `env`. Each person's first Claude Code session then opens the approval page by itself (at most once a day until they approve): they press Approve, and that's it.
 
 ### Scripts and CI
 
 `MNEMIO_URL` and `MNEMIO_TOKEN` in the environment take precedence over the saved sign-in (a token made by hand in Settings → Claude). A saved sign-in is only ever sent to the workspace it came from.
 
-## Answer chat apps with your own Claude
+## Your chats, answered by your own Claude
 
-In **Mnemio → Settings → Claude**, set **Who answers your chat apps** to **My own Claude**. From then on Mnemio never answers your Slack, Discord or WhatsApp messages itself: it queues each message and your Claude answers it in the same thread or chat. If no Claude is connected, the message waits for up to a day and you're told so.
+Once connected, your Mnemio chats — the web chat, Slack, Discord, WhatsApp, colleague requests — go to your own Claude instead of Mnemio's assistant (switch back in Settings → Claude). Mnemio never answers them itself. Something has to collect them:
 
-### Channel mode (Claude Code on your computer)
+### On your computer: the background listener (recommended)
 
-Start a session that listens for your messages and leave it running:
+Turned on by the install command, or with `/mnemio:listen on`. A small background service (a macOS launch agent or a Linux user service, started at login) collects each message and answers it with `claude -p` — your own Claude Code, signed in with your own plan — keeping one Claude session per conversation. No Claude Code window needs to be open. Messages can come from shared threads, so Claude only gets what answering needs: Mnemio's tools and company skills, and reading the files that came with the message; no shell, no writing files, no web.
+
+`/mnemio:listen status` shows whether it's running; its log is in `~/.config/mnemio/listener/listener.log`.
+
+### In a Claude Code session: channel mode
+
+To answer in an open session instead (research preview; until this plugin is on Anthropic's approved list it needs the development flag, which only works interactively):
 
 ```sh
 MNEMIO_CHANNEL=1 claude --dangerously-load-development-channels plugin:mnemio@mnemio
 ```
-
-It uses the sign-in from `/mnemio:connect`.
-
-Set `MNEMIO_CHANNEL=1` only on this command, not in your shell profile: a session that wasn't started as a channel can't show the messages it collects, so they would sit unanswered for 15 minutes before going back in the queue.
-
-Claude Code channels are a research preview. Until this plugin is on Anthropic's approved channel list it loads with the development flag above, which only works in an interactive session. On Team and Enterprise plans an Owner must turn channels on, and can approve this plugin for everyone with `allowedChannelPlugins` in managed settings.
 
 ### Cloud mode (no computer needed)
 
@@ -82,8 +90,9 @@ A burst of messages starts one run, which answers all of them. Anthropic allows 
 | --- | --- |
 | `hooks/hooks.json` | SessionStart: settings from Mnemio, company skills installed, retry of anything unsent. UserPromptSubmit: recall. PostToolUse: sync memory files and project skills. Stop: save the answer. |
 | `scripts/brain.mjs` | The client Claude runs: `skills`, `skill <name>`, `recall`, `save`, `inbox`, `reply <id> [--file path]`, `tools`, `tool <name>`. |
-| `scripts/channel.mjs` | That server: Mnemio's tools, and when listening, your messages with a `reply` tool. |
-| `commands/` | `/mnemio:connect`, `status`, `sync-here`, `disconnect`. |
+| `scripts/channel.mjs` | That server: Mnemio's tools, and in channel mode, your messages with a `reply` tool. |
+| `scripts/listener.mjs` | The background listener: collects your messages and answers each with `claude -p`. |
+| `commands/` | `/mnemio:connect`, `listen`, `status`, `sync-here`, `disconnect`. |
 | `.mcp.json` | One local server (`scripts/channel.mjs`): Mnemio's tools, the company's MCP servers and your connected apps, passed on from Mnemio with your sign-in, plus the channel when you listen. |
 | `cloud/scheduled-task-prompt.md` | What a cloud run does: collect, answer, repeat until the inbox is empty. |
 
