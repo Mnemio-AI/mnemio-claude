@@ -87,3 +87,7 @@ claude plugin validate .
 ```
 
 This folder has no imports from the Mnemio server code, so it can move to its own repository as it is.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). "Mnemio" is a trademark of Mnemio AI; forks must not present themselves as the official Mnemio plugin.

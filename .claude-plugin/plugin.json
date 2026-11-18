@@ -2,7 +2,17 @@
   "name": "mnemio",
   "version": "0.3.0",
   "description": "Connect Claude to your Mnemio company brain: company skills and memory in every session, and your Slack, Discord and WhatsApp messages answered by your own Claude.",
-  "author": { "name": "Mnemio" },
+  "author": {
+    "name": "Mnemio"
+  },
   "homepage": "https://mnemio.ai",
-  "keywords": ["memory", "skills", "slack", "whatsapp", "company-brain"]
+  "keywords": [
+    "memory",
+    "skills",
+    "slack",
+    "whatsapp",
+    "company-brain"
+  ],
+  "license": "Apache-2.0",
+  "repository": "https://github.com/Mnemio-AI/mnemio-claude"
 }
