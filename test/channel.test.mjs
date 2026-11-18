@@ -64,7 +64,7 @@ test("a cloud run collects and answers with the token the proxy adds, never one 
     seen.push({ path: url.pathname, auth: opts.headers.authorization, body: JSON.parse(opts.body) });
     return Response.json(url.pathname.endsWith("/claim") ? { messages: [message] } : { delivered: "reply" });
   };
-  assert.deepEqual(await run("inbox", "", cloud, request), { messages: [message] });
+  assert.deepEqual(await run("inbox", "", cloud, request), { messages: [{ ...message, files: [] }] }, "each message lists where its files were saved (none here)");
   await run("reply", "Planning at 2.", cloud, request, message.id);
   assert.deepEqual(seen, [
     { path: "/api/claude/inbox/claim", auth: undefined, body: { limit: 10 } },

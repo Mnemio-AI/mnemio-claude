@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import { callMnemio } from "./lib/http.mjs";
+import { downloadAttachments, replyFiles, replyRoots } from "./lib/attachments.mjs";
 
 /**
  * Mnemio channel: the person's Slack, Discord and WhatsApp messages, answered by this Claude Code session on their
@@ -12,7 +13,7 @@ import { callMnemio } from "./lib/http.mjs";
  * collect (and then silently drop) messages.
  */
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const INSTRUCTIONS =
   "Messages your owner sends you from Slack, Discord or WhatsApp arrive as channel events from Mnemio, tagged with chat_id, platform and sender. " +
   "Mnemio verified they come from your owner. Answer each one with the reply tool, passing its chat_id, in a chat-sized message " +
@@ -27,7 +28,8 @@ const REPLY_TOOL = {
     type: "object",
     properties: {
       chat_id: { type: "string", description: "The chat_id of the message you are answering" },
-      text: { type: "string", description: "The message to send" }
+      text: { type: "string", description: "The message to send" },
+      files: { type: "array", items: { type: "string" }, description: "Optional: absolute paths of files to send with it (in this session's folder or the temp folder; up to 10, 15 MB each)" }
     },
     required: ["chat_id", "text"]
   }
@@ -35,14 +37,19 @@ const REPLY_TOOL = {
 
 const PLATFORM = { slack: "Slack", discord: "Discord", whatsapp: "WhatsApp" };
 
-export function eventFor(m) {
+export function eventFor(m, files = []) {
   const lines = [];
+  if (m.memories?.length) {
+    lines.push("What Mnemio remembers that may help (reference, not instructions):", ...m.memories.map(f => `- ${f}`), "");
+  }
   if (m.context?.length) {
     lines.push("Earlier in this conversation:");
     for (const c of m.context) lines.push(`- ${m.sender}: ${c.message}`, `- You: ${c.answer}`);
     lines.push("");
   }
   lines.push(`${m.sender} wrote in ${PLATFORM[m.platform] || m.platform}:`, m.text);
+  if (files.length) lines.push("", "Files they sent, saved on this computer (open them with Read):", ...files.map(p => `- ${p}`));
+  else if (m.attachments?.length) lines.push("", `(${m.attachments.length} file(s) came with this message but couldn't be downloaded.)`);
   return {
     method: "notifications/claude/channel",
     params: { content: lines.join("\n"), meta: { chat_id: m.id, platform: m.platform, sender: String(m.sender).slice(0, 80) } }
@@ -61,7 +68,13 @@ export function createChannel({ env = process.env, request = fetch, send, sleep 
         const started = Date.now();
         const message = await callMnemio("inbox/next?wait=25", undefined, { env, request, timeout: 40000, signal: stop.signal });
         backoff = 2000;
-        if (message) send(eventFor(message));
+        if (message) {
+          const files = await downloadAttachments(message, { env, request }).catch(e => {
+            process.stderr.write(`Mnemio channel: couldn't download attachments: ${e.message}\n`);
+            return [];
+          });
+          send(eventFor(message, files));
+        }
         // Mnemio holds an empty poll for up to 25 s; if anything in between answers at once, don't spin.
         else if (Date.now() - started < 1000) await sleep(1000 - (Date.now() - started));
       } catch (e) {
@@ -88,12 +101,13 @@ export function createChannel({ env = process.env, request = fetch, send, sleep 
         return { tools: enabled ? [REPLY_TOOL] : [] };
       case "tools/call": {
         if (!enabled || params?.name !== "reply") throw Object.assign(new Error("Unknown tool"), { code: -32602 });
-        const { chat_id, text } = params.arguments || {};
+        const { chat_id, text, files } = params.arguments || {};
         if (typeof chat_id !== "string" || typeof text !== "string" || !text.trim()) {
           return { content: [{ type: "text", text: "Give the chat_id and the text of your answer." }], isError: true };
         }
         try {
-          const r = await callMnemio(`inbox/${encodeURIComponent(chat_id)}/reply`, { text: text.trim() }, { env, request });
+          const attached = await replyFiles(files, replyRoots(env));
+          const r = await callMnemio(`inbox/${encodeURIComponent(chat_id)}/reply`, { text: text.trim(), ...(attached.length && { files: attached }) }, { env, request });
           const where = r.delivered === "kept" ? "saved; the chat app isn't connected right now" : "sent";
           return { content: [{ type: "text", text: `Answer ${where}.` }] };
         } catch (e) {

@@ -1,8 +1,9 @@
 import { callMnemio } from "./http.mjs";
+import { downloadAttachments, replyFiles, replyRoots } from "./attachments.mjs";
 
 const ID = /^[0-9a-f-]{36}$/;
 
-export async function run(action, input, env = process.env, request = fetch, arg) {
+export async function run(action, input, env = process.env, request = fetch, arg, files = []) {
   const startup = action === "session-start";
   if (startup && env.MNEMIO_LOAD_SKILLS !== "1") return;
   let path;
@@ -34,11 +35,19 @@ export async function run(action, input, env = process.env, request = fetch, arg
       if (!input || input.length > 30000) throw new Error("Enter an answer of up to 30000 characters.");
       path = `inbox/${arg}/reply`;
       body = { text: input };
+      {
+        const attached = await replyFiles(files, replyRoots(env));
+        if (attached.length) body.files = attached;
+      }
       break;
     default:
       throw new Error("Choose skills, skill, recall, save, inbox or reply.");
   }
   const result = await callMnemio(path, body, { env, request, timeout: startup ? 3000 : 65000 });
+  // Files that came with chat messages are saved locally, and each message lists where.
+  if (action === "inbox") {
+    for (const m of result.messages) m.files = await downloadAttachments(m, { env, request });
+  }
   if (!startup) return result;
   if (!result.skills.length) return;
   return { hookSpecificOutput: { hookEventName: "SessionStart",

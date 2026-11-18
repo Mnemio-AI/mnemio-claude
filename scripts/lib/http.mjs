@@ -17,6 +17,19 @@ export function mnemioConfig(env = process.env) {
   return { url, token: env.MNEMIO_TOKEN || null };
 }
 
+/** A raw response (file downloads). Throws on an error status. */
+export async function fetchMnemio(path, { env = process.env, request = fetch, timeout = 120000 } = {}) {
+  const { url, token } = mnemioConfig(env);
+  const response = await request(new URL("/api/claude/" + path, url), {
+    method: "GET", headers: token ? { authorization: "Bearer " + token } : {}, redirect: "error", signal: AbortSignal.timeout(timeout)
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(`Mnemio HTTP ${response.status}: ${detail.error || "request failed"}`);
+  }
+  return response;
+}
+
 export async function callMnemio(path, payload, { env = process.env, request = fetch, timeout = 65000, method, signal } = {}) {
   const { url, token } = mnemioConfig(env);
   const headers = token ? { authorization: "Bearer " + token } : {};
