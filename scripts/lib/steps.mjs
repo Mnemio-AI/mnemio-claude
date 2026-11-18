@@ -8,8 +8,16 @@ import { basename } from "node:path";
  * approval's details or any other tool input.
  */
 
-const MNEMIO_TOOL = /^mcp__plugin_mnemio_mnemio__(.+)$/;
+/** Mnemio's tools: as the listener loads them (mcp__mnemio__…) or through the plugin (mcp__plugin_mnemio_mnemio__…). */
+const MNEMIO_TOOL = /^mcp__(?:plugin_mnemio_)?mnemio__(.+)$/;
 const PREVIEW_CHARS = 120;
+/** Mnemio takes step labels up to 80 characters. */
+const LABEL_CHARS = 80;
+/**
+ * A name Claude gave a tool (a skill's, a connected tool's) that may go in a label: a plain identifier. Anything else
+ * (Claude can put any text there, even if the tool then refuses it) gets a fixed label instead.
+ */
+const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,60}$/;
 
 /** Mnemio's own tools (the server's krut-mcp.ts), by what the person would call them. */
 const MNEMIO_WORDS = {
@@ -42,15 +50,28 @@ const HIDDEN = new Set(["ToolSearch"]);
 /** { tool, preview } for one tool use from Claude's stream (name and input as Claude Code reports them); null to leave it out. */
 export function describeStep(name, input = {}) {
   if (HIDDEN.has(name)) return null;
+  const step = describe(name, input);
+  return { ...step, tool: step.tool.slice(0, LABEL_CHARS) };
+}
+
+const safe = v => (typeof v === "string" && SAFE_NAME.test(v) ? v : null);
+
+function describe(name, input) {
   const mnemio = MNEMIO_TOOL.exec(name)?.[1];
   if (mnemio) {
     if (/recall|memor/i.test(mnemio)) return { tool: "Searching memory", preview: clip(typeof input.query === "string" ? input.query : "") };
-    if (mnemio === "call_connected_tool") return { tool: `Using ${words(input.tool || input.name || "a connected tool")}`, preview: "" };
+    if (mnemio === "call_connected_tool") {
+      const tool = safe(input.tool) ?? safe(input.name);
+      return { tool: tool ? `Using ${words(tool)}` : "Using a connected tool", preview: "" };
+    }
     return { tool: MNEMIO_WORDS[mnemio] || `Using ${words(mnemio)}`, preview: "" };
   }
   // The apps the person connected in Mnemio (Gmail, Notion, …), through the plugin's MCP server too.
   if (/^mcp__/.test(name)) return { tool: `Using ${words(name)}`, preview: "" };
-  if (name === "Skill") return { tool: `Using ${String(input.skill || input.command || "a skill").replace(/^\//, "")}`, preview: "" };
+  if (name === "Skill") {
+    const skill = safe(String(input.skill ?? input.command ?? "").replace(/^\//, ""));
+    return { tool: skill ? `Using ${skill}` : "Using a skill", preview: "" };
+  }
   if (name === "Read") return { tool: "Reading a file", preview: input.file_path ? basename(String(input.file_path)) : "" };
   if (name === "Write" || name === "Edit") return { tool: "Making a file", preview: input.file_path ? basename(String(input.file_path)) : "" };
   if (name === "Glob" || name === "Grep") return { tool: "Looking through files", preview: "" };

@@ -5,8 +5,8 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { answerOne, claudeArgs, install, listenerDir, messageFolder, openFence, replyText, run, runClaude, shortName, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
+import { dirname, join } from "node:path";
+import { answerOne, claudeArgs, install, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, runClaude, shortName, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
 import { readCredentials } from "../scripts/lib/credentials.mjs";
@@ -60,7 +60,12 @@ const message = (id, text, conversation = "web:c1") => ({ id, conversation, plat
 const outboxOf = args => /^Edit\(\/(\/.+)\/\*\*\)$/.exec(args.find(a => a.startsWith("Edit(")))[1];
 
 test("claude runs with only Mnemio's tools, skills, reading this message's folder and writing its outbox", () => {
-  assert.deepEqual(claudeArgs({ sessionId: "s1", folder: "/c/messages/m1", outbox: "/c/messages/m1/outbox" }), ["-p", "--output-format", "stream-json", "--verbose", "--resume", "s1", "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", "Read(//c/messages/m1/**)", "Edit(//c/messages/m1/outbox/**)"]);
+  assert.deepEqual(claudeArgs({ sessionId: "s1", folder: "/c/messages/m1", outbox: "/c/messages/m1/outbox", mcp: "{}" }), ["-p", "--output-format", "stream-json", "--verbose", "--resume", "s1", "--tools", "Read,Edit,Write,Skill,ToolSearch", "--strict-mcp-config", "--mcp-config", "{}", "--allowedTools", "mcp__mnemio", "Skill", "Read(//c/messages/m1/**)", "Edit(//c/messages/m1/outbox/**)"]);
+  // Only Mnemio's own server, started from this plugin.
+  const servers = JSON.parse(mcpConfig("/usr/bin/node")).mcpServers;
+  assert.deepEqual(Object.keys(servers), ["mnemio"]);
+  assert.equal(servers.mnemio.command, "/usr/bin/node");
+  assert.match(servers.mnemio.args[0], /scripts\/channel\.mjs$/);
   assert.ok(!claudeArgs({ folder: "/f", outbox: "/f/outbox" }).includes("--resume"));
 });
 
@@ -197,6 +202,7 @@ test("reads Claude's stream: each tool use as it starts and ends, then the resul
 
 test("steps get the names a person would use, and a preview only where it can't carry private text", () => {
   assert.deepEqual(describeStep("mcp__plugin_mnemio_mnemio__list_goals", {}), { tool: "Checking goals", preview: "" });
+  assert.deepEqual(describeStep("mcp__mnemio__list_goals", {}), { tool: "Checking goals", preview: "" }, "as the listener loads them");
   assert.deepEqual(describeStep("mcp__plugin_mnemio_mnemio__recall_memory", { query: "rollout  plan" }), { tool: "Searching memory", preview: "rollout plan" });
   assert.equal(describeStep("Skill", { skill: "mnemio-release-checklist" }).tool, "Using mnemio-release-checklist");
   assert.equal(describeStep("mcp__plugin_mnemio_mnemio__GMAIL_FETCH_EMAILS", { query: "x" }).tool, "Using gmail fetch emails");
@@ -209,6 +215,10 @@ test("steps get the names a person would use, and a preview only where it can't 
   assert.equal(describeStep("mcp__plugin_mnemio_mnemio__request_approval", { title: "Pay invoice", details: "IBAN …" }).preview, "");
   assert.equal(describeStep("Grep", { pattern: "password" }).preview, "");
   assert.equal(describeStep("ToolSearch", { query: "select:mcp__plugin_mnemio_mnemio__list_goals" }), null, "Claude Code's plumbing isn't a step");
+  // A name Claude made up (any text, before the tool checks it) never goes in the label: only plain identifiers.
+  assert.equal(describeStep("Skill", { skill: "my salary is 90k" }).tool, "Using a skill");
+  assert.equal(describeStep("mcp__plugin_mnemio_mnemio__call_connected_tool", { tool: "send the board deck to bob" }).tool, "Using a connected tool");
+  assert.ok(describeStep("mcp__plugin_mnemio_mnemio__" + "X".repeat(150), {}).tool.length <= 80, "labels fit Mnemio's 80 characters");
 });
 
 /** A Mnemio that records the plugin API calls. */
@@ -233,10 +243,11 @@ test("reports each step to Mnemio as it happens, then sends the answer with the 
   fs.mkdirSync(join(workDir(env), "inbox", "7d0c8a5e-0000-4000-8000-0000000000a0"), { recursive: true });
   fs.writeFileSync(join(workDir(env), "inbox", "7d0c8a5e-0000-4000-8000-0000000000a0", "other.pdf"), "someone else's");
   const long = "q".repeat(230) + ".xlsx";
+  let box;
   const claude = fakeClaude((args, input, cwd) => {
-    const box = outboxOf(args);
-    assert.equal(box, join(listenerDir(env), "messages", id, "outbox"), "this message's own outbox");
-    assert.ok(args.includes(`Read(/${join(listenerDir(env), "messages", id)}/**)`), "reading only this message's folder");
+    box = outboxOf(args);
+    assert.match(box, new RegExp(`/listener/messages/${id}\\.[0-9a-f]{8}/outbox$`), "this message's own outbox, one per claim");
+    assert.ok(args.includes(`Read(/${dirname(box)}/**)`), "reading only this message's folder");
     assert.ok(!args.some(a => a.startsWith("Read(./")), "not the working folder");
     assert.ok(!fs.existsSync(join(cwd, "inbox")), "earlier versions' files are gone");
     assert.ok(!fs.existsSync(join(box, "old.txt")), "the outbox starts empty");
@@ -252,7 +263,7 @@ test("reports each step to Mnemio as it happens, then sends the answer with the 
     return [toolUse("t0", "ToolSearch", { query: "goals" }), toolResult("t0"), toolUse("t1", "mcp__plugin_mnemio_mnemio__list_goals", {}), toolResult("t1"), toolUse("t2", "Write", { file_path: join(box, "report.csv") }), toolResult("t2"), success("Here's the report.")];
   });
   const text = await answerOne(message(id, "Make me a report"), { env, request, spawnFn: claude.spawnFn });
-  assert.ok(claude.calls[0].input.includes(`write it into ${join(listenerDir(env), "messages", id, "outbox")}/`));
+  assert.ok(claude.calls[0].input.includes(`write it into ${box}/`));
   assert.deepEqual(calls.map(c => c.path), [...Array(4).fill(`/api/claude/inbox/${id}/progress`), `/api/claude/inbox/${id}/reply`], "steps first, in order, then the answer");
   assert.deepEqual(calls.slice(0, 4).map(c => c.body), [
     { step: "t1", tool: "Checking goals", preview: "", state: "started" },
@@ -266,7 +277,7 @@ test("reports each step to Mnemio as it happens, then sends the answer with the 
   assert.ok(reply.files.every(f => f.name.length <= 120), "names the reply API takes");
   assert.equal(Buffer.from(reply.files[2].data, "base64").toString(), "a,b\n1,2\n");
   assert.match(text, /^Here's the report\.[\s\S]*Not sent: a\/b\/c\/d\/e\/f\/g\/ \(folders nested too deep\), big\.bin\./, "files left out are named, deep folders too");
-  assert.ok(!fs.existsSync(join(listenerDir(env), "messages", id)), "the message's folder is removed after sending");
+  assert.ok(!fs.existsSync(dirname(box)), "the message's folder is removed after sending");
 });
 
 test("one message's files never go out with another conversation's answer, even when the first one failed", async t => {
@@ -347,6 +358,7 @@ test("the reply always fits the reply API: a long answer is cut, and the note ab
   assert.equal(openFence("````md\n```js\nx\n```\n````\nprose"), "");
   assert.equal(openFence("text\n````md\n```js\nx\n```"), "````");
   assert.equal(openFence("~~~\nx"), "~~~");
+  assert.equal(openFence("text\r\n```js\r\nx\r\n"), "```", "Windows line endings too");
   const longFence = replyText("`".repeat(40) + "\n" + "z".repeat(40_000), []);
   assert.ok(longFence.length <= 30_000, "room is kept for a closing fence of any length");
   assert.match(longFence, new RegExp("\\n" + "`".repeat(40) + "\\n\\n_\\(Cut short"));
@@ -430,4 +442,41 @@ test("a step report that fails never holds the answer up", async t => {
   const claude = fakeClaude(() => [toolUse("t1", "Read", { file_path: "/w/inbox/a.pdf" }), toolResult("t1"), success("Read it.")]);
   assert.equal(await answerOne(message("7d0c8a5e-0000-4000-8000-0000000000c1", "Summarise"), { env, request, spawnFn: claude.spawnFn }), "Read it.");
   assert.deepEqual(sent, [{ text: "Read it.", steps: [{ step: "t1", state: "done" }] }], "the step's end goes with the answer instead");
+});
+
+test("an outbox that was swapped for a link sends nothing", async t => {
+  const env = await home(t);
+  const fs = require("node:fs");
+  const box = messageFolder(listenerDir(env), "7d0c8a5e-0000-4000-8000-0000000000e9");
+  fs.rmSync(box.outbox, { recursive: true });
+  fs.symlinkSync(env.MNEMIO_CONFIG_DIR, box.outbox);
+  await assert.rejects(outboxFiles(box.outbox), /moved or replaced/);
+});
+
+test("when Claude stops mid-way, the failure says how its steps ended: unfinished ones failed", async t => {
+  const env = await home(t);
+  const sent = [];
+  const request = async (url, opts) => {
+    if (url.pathname.endsWith("/next")) return Response.json(message("7d0c8a5e-0000-4000-8000-0000000000ea", "Hi"));
+    sent.push({ path: url.pathname, body: JSON.parse(opts.body) });
+    return Response.json({ ok: true });
+  };
+  const claude = fakeClaude(() => [toolUse("t1", "mcp__plugin_mnemio_mnemio__list_goals", {}), toolResult("t1"), toolUse("t2", "Read", { file_path: "/x/a.pdf" })]);
+  await run({ env, request, spawnFn: claude.spawnFn, once: true });
+  const failure = sent.find(s => s.path.endsWith("/reply")).body;
+  assert.equal(failure.failed, true);
+  assert.deepEqual(failure.steps, [{ step: "t2", state: "failed" }], "the cut-off step is failed; the finished one was already confirmed");
+});
+
+test("a workspace that is a link isn't cleared through it", async t => {
+  const env = await home(t);
+  const fs = require("node:fs");
+  const elsewhere = join(env.MNEMIO_CONFIG_DIR, "elsewhere");
+  fs.mkdirSync(join(elsewhere, "inbox"), { recursive: true });
+  fs.writeFileSync(join(elsewhere, "inbox", "keep.txt"), "keep");
+  fs.mkdirSync(listenerDir(env), { recursive: true });
+  fs.symlinkSync(elsewhere, workDir(env));
+  const { request } = recorder();
+  await answerOne(message("7d0c8a5e-0000-4000-8000-0000000000eb", "Hi"), { env, request, spawnFn: fakeClaude(() => success("Hello.")).spawnFn });
+  assert.ok(fs.existsSync(join(elsewhere, "inbox", "keep.txt")));
 });

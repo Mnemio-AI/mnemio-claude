@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { StringDecoder } from "node:string_decoder";
+import { randomUUID } from "node:crypto";
 import { callMnemio, isConnected } from "./lib/http.mjs";
 import { configDir } from "./lib/credentials.mjs";
 import { downloadAttachments, LIMITS, replyFiles } from "./lib/attachments.mjs";
@@ -62,17 +63,32 @@ const writeJson = (p, v) => { mkdirSync(dirname(p), { recursive: true, mode: 0o7
 /** Where Claude works: an empty folder, the same for every message (Claude Code keeps its sessions by folder). */
 export const workDir = (env = process.env) => join(listenerDir(env), "workspace");
 
+/** The built-in tools the listener's Claude has at all: reading and writing files (as the rules below allow), skills. */
+const TOOLS = "Read,Edit,Write,Skill,ToolSearch";
+
+/**
+ * Mnemio's tools, and no other MCP server: the plugin's own server (channel.mjs), started directly, so the person's
+ * other servers and claude.ai connectors (their Drive, a design tool, …) are never in reach of a message.
+ */
+export const mcpConfig = (node = process.execPath) =>
+  JSON.stringify({ mcpServers: { mnemio: { command: node, args: [new URL("./channel.mjs", import.meta.url).pathname], env: { MNEMIO_CHANNEL: "" } } } });
+
 /**
  * The arguments for one `claude -p` answer. `folder` is this message's folder and `outbox` its outbox (full paths):
  * the only ones Claude may read, and write to. Claude Code writes an absolute path in a rule with a leading "//".
  * Writing is granted with an Edit rule (it covers Write too; a Write(...) rule grants nothing).
+ *
+ * What it can do doesn't depend on the person's own Claude Code settings: `--tools` leaves out the shell, the web and
+ * everything else even if their settings allow them, and `--strict-mcp-config` loads only Mnemio's server.
  */
-export function claudeArgs({ sessionId, folder, outbox, extra = [] }) {
+export function claudeArgs({ sessionId, folder, outbox, extra = [], mcp = mcpConfig() }) {
   return [
     // stream-json (which needs --verbose with -p): each tool use as it happens, for the live steps; the last line is the result.
     "-p", "--output-format", "stream-json", "--verbose",
     ...(sessionId ? ["--resume", sessionId] : []),
-    "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", `Read(/${folder}/**)`, `Edit(/${outbox}/**)`,
+    "--tools", TOOLS,
+    "--strict-mcp-config", "--mcp-config", mcp,
+    "--allowedTools", "mcp__mnemio", "Skill", `Read(/${folder}/**)`, `Edit(/${outbox}/**)`,
     ...extra
   ];
 }
@@ -147,7 +163,10 @@ export function runClaude(prompt, { bin, args, cwd, env = process.env, spawnFn =
  * answer to carry (a failed step must never show as done).
  */
 export function stepReporter(m, { env = process.env, request = fetch, flushMs = FLUSH_MS } = {}) {
+  /** Step id → its label, for steps whose start was reported. */
   const ids = new Map();
+  /** Steps started and not ended yet: if Claude stops, they were cut off. */
+  const running = new Set();
   /** Step id → how it ended, until Mnemio confirmed that report. */
   const ends = new Map();
   let chain = Promise.resolve();
@@ -167,15 +186,24 @@ export function stepReporter(m, { env = process.env, request = fetch, flushMs = 
         const step = describeStep(e.name, e.input);
         if (!step) return;
         ids.set(e.id, step.tool);
+        running.add(String(e.id ?? "").slice(0, 100));
         post({ step: String(e.id ?? "").slice(0, 100), tool: step.tool, preview: step.preview, state: "started" });
       } else if (ids.has(e.id)) {
         const step = String(e.id ?? "").slice(0, 100);
+        running.delete(step);
         ends.set(step, e.state);
         post({ step, tool: ids.get(e.id), state: e.state });
       }
     },
-    /** At most 100 (what Mnemio keeps), failed ones first: those must never show as done. */
-    unconfirmed: () => [...ends].map(([step, state]) => ({ step, state })).sort((a, b) => (a.state === "failed" ? 0 : 1) - (b.state === "failed" ? 0 : 1)).slice(0, 100),
+    /**
+     * At most 100 (what Mnemio keeps), failed ones first: those must never show as done. `interrupted`: Claude
+     * stopped, so steps still running were cut off — they count as failed.
+     */
+    unconfirmed: ({ interrupted = false } = {}) =>
+      [...ends, ...(interrupted ? [...running].map(step => [step, "failed"]) : [])]
+        .map(([step, state]) => ({ step, state }))
+        .sort((a, b) => (a.state === "failed" ? 0 : 1) - (b.state === "failed" ? 0 : 1))
+        .slice(0, 100),
     flush: async () => {
       await Promise.race([chain, new Promise(r => setTimeout(r, flushMs))]);
       closed = true;
@@ -210,10 +238,11 @@ export function messageFolder(dir, id) {
   realDir(root);
   for (const e of readdirSync(root, { withFileTypes: true })) {
     const p = join(root, e.name);
-    try { if (e.name !== id && Date.now() - lstatSync(p).mtimeMs > STALE_MESSAGE_MS) rmSync(p, { recursive: true, force: true }); } catch {}
+    try { if (Date.now() - lstatSync(p).mtimeMs > STALE_MESSAGE_MS) rmSync(p, { recursive: true, force: true }); } catch {}
   }
-  const base = join(root, id);
-  rmSync(base, { recursive: true, force: true });
+  // One folder per claim: if Mnemio hands the message to a second listener (the first took longer than its lease),
+  // neither can touch the other's files.
+  const base = join(root, `${id}.${randomUUID().slice(0, 8)}`);
   mkdirSync(join(base, "outbox"), { recursive: true, mode: 0o700 });
   // Real paths: Claude Code matches its rules against them (on macOS, /tmp is /private/tmp).
   const real = realpathSync(base);
@@ -234,7 +263,7 @@ const cut = (s, n) => {
 export function openFence(text) {
   let open = null;
   for (const line of text.split("\n")) {
-    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line.replace(/\r$/, ""));
     if (!m) continue;
     const [, fence, rest] = m;
     if (!open) {
@@ -259,8 +288,11 @@ export function shortName(name) {
  * link or hidden ones.
  */
 export async function outboxFiles(folder, maxDepth = 6) {
+  // The outbox itself must still be the real folder made for this message: never a link to somewhere else.
+  const info = lstatSync(folder);
+  if (info.isSymbolicLink() || !info.isDirectory() || realpathSync(folder) !== folder) throw new Error("The outbox was moved or replaced; nothing was sent from it.");
   // replyFiles wants real paths (it refuses anything reached through a link).
-  const outbox = realpathSync(folder);
+  const outbox = folder;
   const rel = p => p.slice(outbox.length + 1);
   const found = [];
   const skipped = [];
@@ -323,14 +355,16 @@ export async function answerOne(m, { env = process.env, request = fetch, spawnFn
   const dir = workDir(env);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   // Earlier versions kept every message's files in the working folder (inbox/, outbox/): gone, so none stay readable.
-  for (const old of ["inbox", "outbox"]) rmSync(join(dir, old), { recursive: true, force: true });
+  // Only in a real folder: a workspace that's a link points somewhere this mustn't clear.
+  if (!lstatSync(dir).isSymbolicLink()) for (const old of ["inbox", "outbox"]) rmSync(join(dir, old), { recursive: true, force: true });
   let box = messageFolder(listenerDir(env), m.id);
+  let steps;
   try {
     const files = await downloadAttachments(m, { env, request, folder: box.files }).catch(() => []);
     const prompt = eventFor(m, files).params.content + instructions(box.outbox);
     const sessions = readJson(sessionsPath(env), {});
     const key = m.conversation || m.id;
-    const steps = stepReporter(m, { env, request });
+    steps = stepReporter(m, { env, request });
     const run = sessionId => runClaude(prompt, { bin: settings.claude, args: claudeArgs({ sessionId, folder: box.base, outbox: box.outbox, extra: settings.extraArgs }), cwd: dir, env: settings.env, spawnFn, onTool: steps.onTool });
     let result;
     try {
@@ -349,6 +383,14 @@ export async function answerOne(m, { env = process.env, request = fetch, spawnFn
     const ends = steps.unconfirmed();
     await callMnemio(`inbox/${encodeURIComponent(m.id)}/reply`, { text, ...(out.files.length && { files: out.files }), ...(ends.length && { steps: ends }) }, { env, request });
     return text;
+  } catch (e) {
+    // Claude stopped (or the answer couldn't be sent): how its steps ended goes with the failure reply, steps still
+    // running counted as failed, so none is left "running" or shown as done.
+    if (steps) {
+      await steps.flush();
+      e.steps = steps.unconfirmed({ interrupted: true });
+    }
+    throw e;
   } finally {
     rmSync(box.base, { recursive: true, force: true });
   }
@@ -391,7 +433,7 @@ export async function run({ env = process.env, request = fetch, spawnFn = spawn,
           state.lastError = e.detail ? `${e.message} ${e.detail}` : e.message;
           // Tell them rather than leave them waiting; the message isn't retried. `failed`: Mnemio doesn't take it for
           // an answer (a briefing isn't sent as one, nothing is saved to memory).
-          await callMnemio(`inbox/${encodeURIComponent(m.id)}/reply`, { text: `_Your Claude couldn't answer this: ${e.message}_`, failed: true }, { env, request }).catch(() => {});
+          await callMnemio(`inbox/${encodeURIComponent(m.id)}/reply`, { text: `_Your Claude couldn't answer this: ${e.message}_`, failed: true, ...(e.steps?.length && { steps: e.steps }) }, { env, request }).catch(() => {});
         }
       }
       save();
