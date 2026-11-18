@@ -1,0 +1,11 @@
+{
+  "name": "mnemio",
+  "owner": { "name": "Mnemio" },
+  "plugins": [
+    {
+      "name": "mnemio",
+      "source": "./",
+      "description": "Company skills and memory from Mnemio, and your chat apps answered by your own Claude."
+    }
+  ]
+}
