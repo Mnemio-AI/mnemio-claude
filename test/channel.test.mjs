@@ -72,5 +72,5 @@ test("a cloud run collects and answers with the token the proxy adds, never one 
   ]);
   await assert.rejects(run("inbox", "", { CLAUDE_CODE_REMOTE: "true" }, request), /MNEMIO_URL/);
   await assert.rejects(run("reply", "x", cloud, request, "../skills"), /message id/);
-  await assert.rejects(run("inbox", "", { MNEMIO_URL: "https://brain.example" }, request), /MNEMIO_TOKEN/, "locally a token is required");
+  await assert.rejects(run("inbox", "", { MNEMIO_URL: "https://brain.example", MNEMIO_CONFIG_DIR: "/nonexistent-mnemio" }, request), /mnemio:connect/, "locally a sign-in is required");
 });

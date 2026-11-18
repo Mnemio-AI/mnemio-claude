@@ -2,7 +2,8 @@ import { homedir } from "node:os";
 import { dirname, basename, delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import { realpath } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { callMnemio } from "./lib/http.mjs";
+import { callMnemio, isConnected } from "./lib/http.mjs";
+import { workspaceConfig } from "./lib/config.mjs";
 import { run } from "./lib/commands.mjs";
 import { changedSkill, projectSkills, readDocument, syncSkill } from "./lib/project-skills.mjs";
 import { digest, syncDirectory, retain, retry } from "./lib/outbox.mjs";
@@ -10,15 +11,18 @@ import { digest, syncDirectory, retain, retry } from "./lib/outbox.mjs";
 const real = path => realpath(path).catch(() => null);
 
 /**
- * The opted-in project this session works in, or null. MNEMIO_SYNC_PROJECTS lists project folders (separated like
- * PATH); a session started in one of them or anywhere inside it syncs, as that project. MNEMIO_SYNC_PROJECT (one
- * folder) still works. "*" opts in every project: the session's project folder (CLAUDE_PROJECT_DIR), else its cwd.
+ * The opted-in project this session works in, or null. The projects come from Mnemio → Settings → Claude ("every
+ * project", or the ones added with /mnemio:sync-here), plus MNEMIO_SYNC_PROJECTS (folders separated like PATH) and
+ * MNEMIO_SYNC_PROJECT. A session started in one of them or anywhere inside it syncs, as that project. "Every
+ * project" (or "*") means the session's project folder (CLAUDE_PROJECT_DIR), else its cwd.
  */
-export async function syncProject(event, env) {
+export async function syncProject(event, env, prefs = null) {
   if (typeof event.cwd !== "string") return null;
   const cwd = await real(event.cwd);
   if (!cwd) return null;
   const listed = [env.MNEMIO_SYNC_PROJECTS, env.MNEMIO_SYNC_PROJECT].filter(Boolean).join(delimiter).split(delimiter).map(p => p.trim()).filter(Boolean);
+  listed.push(...(prefs?.projects ?? []));
+  if (prefs?.syncAll) listed.push("*");
   if (listed.includes("*")) return (env.CLAUDE_PROJECT_DIR && isAbsolute(env.CLAUDE_PROJECT_DIR) && await real(env.CLAUDE_PROJECT_DIR)) || cwd;
   // The deepest listed folder that holds the session, so a nested project wins over its parent.
   let best = null;
@@ -31,9 +35,17 @@ export async function syncProject(event, env) {
 
 export async function handle(event, mode, env = process.env, request = fetch) {
   const startup = event.hook_event_name === "SessionStart";
-  const root = await syncProject(event, env);
+  if (!isConnected(env)) {
+    // Once per session, so the person hears how to connect if they ask about Mnemio.
+    if (startup && mode !== "reconcile") return { hookSpecificOutput: { hookEventName: "SessionStart",
+      additionalContext: "The Mnemio plugin is installed but not connected. If the user wants their company brain (memory, skills, Mnemio tools) here, tell them to run /mnemio:connect <their workspace address>." } };
+    return;
+  }
+  const config = await workspaceConfig({ env, request, refresh: startup && mode !== "reconcile" });
+  const root = await syncProject(event, env, config?.prefs);
   if (startup && mode !== "reconcile") {
-    return run("session-start", "", root ? { ...env, MNEMIO_LOAD_SKILLS: "1" } : env, request);
+    const load = env.MNEMIO_LOAD_SKILLS ? env.MNEMIO_LOAD_SKILLS === "1" : config?.prefs?.loadSkills !== false;
+    return run("session-start", "", { ...env, MNEMIO_LOAD_SKILLS: load || root ? "1" : "0" }, request);
   }
   if (!root) return;
   const call = (path, data, timeout) => callMnemio(path, data, { env, request, timeout });

@@ -1,20 +1,42 @@
+import { readCredentials } from "./credentials.mjs";
+
 /**
- * Calls Mnemio's plugin API (/api/claude/*) as the person whose token this is.
+ * Calls Mnemio's plugin API (/api/claude/*) as the person who connected this Claude.
  *
+ * Where the address and token come from, first match wins:
+ *  1. MNEMIO_URL / MNEMIO_TOKEN in the environment (cloud runs, scripts, company-managed setups);
+ *  2. the sign-in saved by /mnemio:connect.
  * In a Claude cloud session (CLAUDE_CODE_REMOTE=true) the token isn't in the environment: it is a network secret
  * that Anthropic's proxy adds to requests for the Mnemio host after they leave the VM, so none is sent from here.
  */
+export const NOT_CONNECTED = "Mnemio isn't connected: run /mnemio:connect <your workspace address>.";
+
 export function mnemioConfig(env = process.env) {
   const cloud = env.CLAUDE_CODE_REMOTE === "true";
-  const url = new URL(env.MNEMIO_URL || (cloud ? "https://unset.invalid" : "http://localhost:8787"));
+  const saved = env.MNEMIO_TOKEN ? null : readCredentials(env);
+  const rawUrl = env.MNEMIO_URL || saved?.url;
+  if (!rawUrl) throw new Error(cloud ? "Set MNEMIO_URL in this cloud environment's environment variables." : NOT_CONNECTED);
+  const url = new URL(rawUrl);
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (cloud && !env.MNEMIO_URL) throw new Error("Set MNEMIO_URL in this cloud environment's environment variables.");
   if (url.username || url.password || url.search || url.hash || url.pathname !== "/" ||
       !(url.protocol === "https:" || (loopback && url.protocol === "http:"))) {
-    throw new Error("Set MNEMIO_URL to an HTTPS workspace origin or a local development address.");
+    throw new Error("The Mnemio address must be an HTTPS workspace origin or a local development address.");
   }
-  if (!env.MNEMIO_TOKEN && !cloud) throw new Error("Set MNEMIO_TOKEN from Mnemio → Settings → Claude before starting Claude Code.");
-  return { url, token: env.MNEMIO_TOKEN || null };
+  // A saved token only ever goes to the workspace it came from.
+  const savedToken = saved && new URL(saved.url).origin === url.origin ? saved.token : null;
+  const token = env.MNEMIO_TOKEN || savedToken || null;
+  if (!token && !cloud) throw new Error(NOT_CONNECTED);
+  return { url, token };
+}
+
+/** Whether this Claude can reach Mnemio (without calling it). */
+export function isConnected(env = process.env) {
+  try {
+    mnemioConfig(env);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** A raw response (file downloads). Throws on an error status. */

@@ -1,5 +1,8 @@
 import { callMnemio, mnemioConfig } from "./http.mjs";
 import { downloadAttachments, replyFiles, replyRoots } from "./attachments.mjs";
+import { connect, disconnect } from "./connect.mjs";
+import { workspaceConfig } from "./config.mjs";
+import { realpath } from "node:fs/promises";
 
 const ID = /^[0-9a-f-]{36}$/;
 
@@ -67,8 +70,25 @@ export async function run(action, input, env = process.env, request = fetch, arg
       }
       return mcpCall({ method: "tools/call", params: { name: arg, arguments: args } }, env, request);
     }
+    // Connecting this computer, and what it syncs.
+    case "connect":
+      return arg === "--wait" ? connect(undefined, { env, request }) : connect(arg || input, { env, request, waitMs: 0 });
+    case "disconnect":
+      return disconnect({ env, request });
+    case "status": {
+      const config = await workspaceConfig({ env, request, refresh: true });
+      if (!config) return { connected: false, message: "Not connected: run /mnemio:connect <your workspace address>." };
+      return { connected: true, workspace: config.workspace, url: config.url, as: config.user, syncs: config.prefs.syncAll ? "every project" : config.prefs.projects, loadsSkills: config.prefs.loadSkills, answersChats: config.answersChats };
+    }
+    case "sync-here":
+    case "stop-sync-here": {
+      const path = await realpath(arg || process.cwd());
+      const r = await callMnemio("config/projects", { path, add: action === "sync-here" }, { env, request });
+      await workspaceConfig({ env, request, refresh: true });
+      return { project: path, syncing: action === "sync-here", projects: r.prefs.projects };
+    }
     default:
-      throw new Error("Choose skills, skill, recall, save, inbox, reply, tools or tool.");
+      throw new Error("Choose connect, disconnect, status, sync-here, stop-sync-here, skills, skill, recall, save, inbox, reply, tools or tool.");
   }
   const result = await callMnemio(path, body, { env, request, timeout: startup ? 3000 : 65000 });
   // Files that came with chat messages are saved locally, and each message lists where.

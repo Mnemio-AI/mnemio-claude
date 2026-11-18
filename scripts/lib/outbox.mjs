@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { mnemioConfig } from "./http.mjs";
+import { configDir } from "./credentials.mjs";
 export const digest = value => createHash("sha256").update(value).digest("hex");
 
 // Scope retry data to one account token, server and project. Rotation never sends old notes as a new user.
 export function syncDirectory(env, project, kind) {
-  if (!env.CLAUDE_PLUGIN_DATA || !env.MNEMIO_TOKEN) throw new Error("Plugin data directory and token required for automatic memory.");
-  return join(env.CLAUDE_PLUGIN_DATA, kind, digest(JSON.stringify([env.MNEMIO_URL || "http://localhost:8787", env.MNEMIO_TOKEN, project])));
+  const { url, token } = mnemioConfig(env);
+  return join(env.CLAUDE_PLUGIN_DATA || join(configDir(env), "data"), kind, digest(JSON.stringify([url.origin, token || "cloud", project])));
 }
 
 export async function retain(dir, payload, send) {
