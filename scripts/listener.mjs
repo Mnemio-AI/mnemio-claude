@@ -308,10 +308,14 @@ export function replyText(answer, skipped = []) {
   const room = REPLY_TEXT_LIMIT - note.length;
   if (answer.length <= room) return answer + note;
   // Cut inside a code block, close it: otherwise the notices (and the file links Mnemio adds) would show as code.
-  let head = cut(answer, room - notice.length - 12);
-  const open = openFence(head);
-  if (open) head += "\n" + open;
-  return head + notice + note;
+  // Room is kept for the closing fence, however long it is.
+  let head = cut(answer, room - notice.length);
+  let close = openFence(head);
+  while (head.length + (close ? close.length + 1 : 0) > room - notice.length) {
+    head = cut(head, room - notice.length - (close ? close.length + 1 : 0));
+    close = openFence(head);
+  }
+  return head + (close ? "\n" + close : "") + notice + note;
 }
 
 /** Answers one collected message; returns what was sent. */

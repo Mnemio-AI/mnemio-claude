@@ -347,6 +347,9 @@ test("the reply always fits the reply API: a long answer is cut, and the note ab
   assert.equal(openFence("````md\n```js\nx\n```\n````\nprose"), "");
   assert.equal(openFence("text\n````md\n```js\nx\n```"), "````");
   assert.equal(openFence("~~~\nx"), "~~~");
+  const longFence = replyText("`".repeat(40) + "\n" + "z".repeat(40_000), []);
+  assert.ok(longFence.length <= 30_000, "room is kept for a closing fence of any length");
+  assert.match(longFence, new RegExp("\\n" + "`".repeat(40) + "\\n\\n_\\(Cut short"));
   const nested = replyText("Example:\n````md\n```js\n" + "y\n".repeat(20_000), []);
   assert.match(nested, /\n````\n\n_\(Cut short/);
   const closed = replyText("````md\n```\nz\n```\n````\n" + "w".repeat(40_000), []);
