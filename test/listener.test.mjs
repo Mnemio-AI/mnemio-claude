@@ -6,7 +6,7 @@ const require = createRequire(import.meta.url);
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { answerOne, claudeArgs, install, run, runClaude, toolEvents, workDir } from "../scripts/listener.mjs";
+import { answerOne, claudeArgs, install, messageOutbox, replyText, run, runClaude, shortName, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
 import { readCredentials } from "../scripts/lib/credentials.mjs";
@@ -21,7 +21,7 @@ async function home(t) {
  * A fake `claude -p`: records what it was given and answers with `reply(args, input, cwd)` — one JSON result, or a
  * list of stream-json lines (tool uses, then the result), written in two chunks that split a line.
  */
-function fakeClaude(reply) {
+function fakeClaude(reply, { bytes = false } = {}) {
   const calls = [];
   const spawnFn = (bin, args, opts) => {
     const child = new EventEmitter();
@@ -33,11 +33,19 @@ function fakeClaude(reply) {
       calls.push({ bin, args, cwd: opts.cwd, input, channel: opts.env.MNEMIO_CHANNEL, listener: opts.env.MNEMIO_LISTENER });
       const r = reply(args, input, opts.cwd);
       setImmediate(() => {
-        const text = Array.isArray(r) ? r.map(l => JSON.stringify(l)).join("\n") + "\n" : JSON.stringify(r);
-        const cut = Math.floor(text.length / 2);
-        child.stdout.emit("data", text.slice(0, cut));
-        child.stdout.emit("data", text.slice(cut));
-        child.emit("close", 0);
+        const text = r === null ? "" : Array.isArray(r) ? r.map(l => JSON.stringify(l)).join("\n") + "\n" : JSON.stringify(r);
+        if (bytes) {
+          // Raw bytes, cut inside the first multi-byte character: the way a pipe can deliver them.
+          const buf = Buffer.from(text);
+          const cut = buf.findIndex(b => b >= 0x80) + 1 || Math.floor(buf.length / 2);
+          child.stdout.emit("data", buf.subarray(0, cut));
+          child.stdout.emit("data", buf.subarray(cut));
+        } else {
+          const cut = Math.floor(text.length / 2);
+          child.stdout.emit("data", text.slice(0, cut));
+          child.stdout.emit("data", text.slice(cut));
+        }
+        child.emit("close", r === null ? 1 : 0);
       });
     } };
     child.kill = () => {};
@@ -48,8 +56,11 @@ function fakeClaude(reply) {
 
 const message = (id, text, conversation = "web:c1") => ({ id, conversation, platform: "web", sender: "Asha", text, context: [], memories: ["Asha ships on Fridays."], attachments: [] });
 
-test("claude runs with only Mnemio's tools, skills, reading its own folder and writing its outbox", () => {
-  assert.deepEqual(claudeArgs({ dir: "/w", sessionId: "s1" }), ["-p", "--output-format", "stream-json", "--verbose", "--resume", "s1", "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", "Read(./**)", "Edit(./outbox/**)"]);
+/** The outbox a fake claude was allowed to write to (from its Edit rule), as a full path. */
+const outboxOf = (args, cwd) => join(cwd, /^Edit\(\.\/(.+)\/\*\*\)$/.exec(args.find(a => a.startsWith("Edit(")))[1]);
+
+test("claude runs with only Mnemio's tools, skills, reading its own folder and writing its message's outbox", () => {
+  assert.deepEqual(claudeArgs({ dir: "/w", sessionId: "s1", outbox: "outbox/m1" }), ["-p", "--output-format", "stream-json", "--verbose", "--resume", "s1", "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", "Read(./**)", "Edit(./outbox/m1/**)"]);
   assert.ok(!claudeArgs({ dir: "/w" }).includes("--resume"));
 });
 
@@ -184,14 +195,19 @@ test("reads Claude's stream: each tool use as it starts and ends, then the resul
   assert.deepEqual(toolEvents({ type: "result" }), []);
 });
 
-test("steps get the names a person would use, and only a short preview", () => {
+test("steps get the names a person would use, and a preview only where it can't carry private text", () => {
   assert.deepEqual(describeStep("mcp__plugin_mnemio_mnemio__list_goals", {}), { tool: "Checking goals", preview: "" });
   assert.deepEqual(describeStep("mcp__plugin_mnemio_mnemio__recall_memory", { query: "rollout  plan" }), { tool: "Searching memory", preview: "rollout plan" });
   assert.equal(describeStep("Skill", { skill: "mnemio-release-checklist" }).tool, "Using mnemio-release-checklist");
   assert.equal(describeStep("mcp__plugin_mnemio_mnemio__GMAIL_FETCH_EMAILS", { query: "x" }).tool, "Using gmail fetch emails");
   assert.equal(describeStep("mcp__plugin_mnemio_mnemio__call_connected_tool", { server: "crm", tool: "find_deal" }).tool, "Using find deal");
   assert.deepEqual(describeStep("Write", { file_path: "/w/outbox/report.csv", content: "secret,stuff" }), { tool: "Making a file", preview: "report.csv" });
-  assert.equal(describeStep("mcp__plugin_mnemio_mnemio__message_colleague", { message: "x".repeat(500) }).preview.length, 120);
+  assert.equal(describeStep("mcp__plugin_mnemio_mnemio__recall_memory", { query: "x".repeat(500) }).preview.length, 120);
+  // These can show in a shared thread: what's being sent or approved never does.
+  assert.equal(describeStep("mcp__plugin_mnemio_mnemio__send_to_my_chat_app", { text: "My salary is…" }).preview, "");
+  assert.equal(describeStep("mcp__plugin_mnemio_mnemio__message_colleague", { colleague_email: "a@b.c", message: "Private" }).preview, "");
+  assert.equal(describeStep("mcp__plugin_mnemio_mnemio__request_approval", { title: "Pay invoice", details: "IBAN …" }).preview, "");
+  assert.equal(describeStep("Grep", { pattern: "password" }).preview, "");
   assert.equal(describeStep("ToolSearch", { query: "select:mcp__plugin_mnemio_mnemio__list_goals" }), null, "Claude Code's plumbing isn't a step");
 });
 
@@ -208,23 +224,29 @@ function recorder() {
 test("reports each step to Mnemio as it happens, then sends the answer with the files Claude put in its outbox", async t => {
   const env = await home(t);
   const { calls, request } = recorder();
-  const { writeFile, mkdir } = await import("node:fs/promises");
-  // Left over from an earlier run that crashed: never sent with this answer.
-  await mkdir(join(workDir(env), "outbox"), { recursive: true });
-  await writeFile(join(workDir(env), "outbox", "old.txt"), "stale");
-  const claude = fakeClaude((args, input, cwd) => {
-    assert.ok(!require("node:fs").existsSync(join(cwd, "outbox", "old.txt")), "the outbox starts empty");
-    require("node:fs").writeFileSync(join(cwd, "outbox", "report.csv"), "a,b\n1,2\n");
-    require("node:fs").mkdirSync(join(cwd, "outbox", "charts"));
-    require("node:fs").writeFileSync(join(cwd, "outbox", "charts", "q3.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
-    require("node:fs").writeFileSync(join(cwd, "outbox", ".hidden"), "no");
-    require("node:fs").writeFileSync(join(cwd, "outbox", "big.bin"), Buffer.alloc(15 * 1024 * 1024 + 1));
-    require("node:fs").symlinkSync("/etc/hosts", join(cwd, "outbox", "hosts"));
-    return [toolUse("t0", "ToolSearch", { query: "goals" }), toolResult("t0"), toolUse("t1", "mcp__plugin_mnemio_mnemio__list_goals", {}), toolResult("t1"), toolUse("t2", "Write", { file_path: join(cwd, "outbox/report.csv") }), toolResult("t2"), success("Here's the report.")];
-  });
+  const fs = require("node:fs");
   const id = "7d0c8a5e-0000-4000-8000-0000000000a1";
+  // Left over from an earlier run of this message that crashed: never sent with this answer.
+  fs.mkdirSync(join(workDir(env), "outbox", id), { recursive: true });
+  fs.writeFileSync(join(workDir(env), "outbox", id, "old.txt"), "stale");
+  const long = "q".repeat(230) + ".xlsx";
+  const claude = fakeClaude((args, input, cwd) => {
+    const box = outboxOf(args, cwd);
+    assert.equal(box, join(cwd, "outbox", id), "this message's own outbox");
+    assert.ok(!fs.existsSync(join(box, "old.txt")), "the outbox starts empty");
+    fs.writeFileSync(join(box, "report.csv"), "a,b\n1,2\n");
+    fs.mkdirSync(join(box, "charts"));
+    fs.writeFileSync(join(box, "charts", "q3.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    fs.writeFileSync(join(box, long), "wide");
+    fs.writeFileSync(join(box, ".hidden"), "no");
+    fs.writeFileSync(join(box, "big.bin"), Buffer.alloc(15 * 1024 * 1024 + 1));
+    fs.mkdirSync(join(box, "a/b/c/d/e/f/g"), { recursive: true });
+    fs.writeFileSync(join(box, "a/b/c/d/e/f/g/deep.txt"), "deep");
+    fs.symlinkSync("/etc/hosts", join(box, "hosts"));
+    return [toolUse("t0", "ToolSearch", { query: "goals" }), toolResult("t0"), toolUse("t1", "mcp__plugin_mnemio_mnemio__list_goals", {}), toolResult("t1"), toolUse("t2", "Write", { file_path: join(box, "report.csv") }), toolResult("t2"), success("Here's the report.")];
+  });
   const text = await answerOne(message(id, "Make me a report"), { env, request, spawnFn: claude.spawnFn });
-  assert.match(claude.calls[0].input, /write it into the outbox folder \(\.\/outbox\/\)/);
+  assert.ok(claude.calls[0].input.includes(`write it into ./outbox/${id}/ in your working folder`));
   assert.deepEqual(calls.map(c => c.path), [...Array(4).fill(`/api/claude/inbox/${id}/progress`), `/api/claude/inbox/${id}/reply`], "steps first, in order, then the answer");
   assert.deepEqual(calls.slice(0, 4).map(c => c.body), [
     { step: "t1", tool: "Checking goals", preview: "", state: "started" },
@@ -233,20 +255,23 @@ test("reports each step to Mnemio as it happens, then sends the answer with the 
     { step: "t2", tool: "Making a file", state: "done" }
   ]);
   const reply = calls[4].body;
-  assert.deepEqual(reply.files.map(f => f.name), ["q3.png", "report.csv"], "regular, visible files only (subfolders too), never through a link");
-  assert.equal(Buffer.from(reply.files[1].data, "base64").toString(), "a,b\n1,2\n");
-  assert.match(text, /^Here's the report\.[\s\S]*Too large or too many to send: big\.bin/);
-  assert.deepEqual(require("node:fs").readdirSync(join(workDir(env), "outbox")), [], "emptied after sending");
+  const short = "q".repeat(114) + "….xlsx";
+  assert.deepEqual(reply.files.map(f => f.name), ["q3.png", short, "report.csv"], "regular, visible files only (subfolders too), never through a link; long names shortened");
+  assert.ok(reply.files.every(f => f.name.length <= 120), "names the reply API takes");
+  assert.equal(Buffer.from(reply.files[2].data, "base64").toString(), "a,b\n1,2\n");
+  assert.match(text, /^Here's the report\.[\s\S]*Not sent: a\/b\/c\/d\/e\/f\/g\/ \(folders nested too deep\), big\.bin\./, "files left out are named, deep folders too");
+  assert.ok(!fs.existsSync(join(workDir(env), "outbox", id)), "removed after sending");
 });
 
 test("one message's files never go out with another conversation's answer, even when the first one failed", async t => {
   const env = await home(t);
   const { calls, request } = recorder();
+  const fs = require("node:fs");
   let n = 0;
   const claude = fakeClaude((args, input, cwd) => {
     n++;
     if (n === 1) {
-      require("node:fs").writeFileSync(join(cwd, "outbox", "private.txt"), "for Asha only");
+      fs.writeFileSync(join(outboxOf(args, cwd), "private.txt"), "for Asha only");
       return { type: "result", subtype: "error_during_execution", is_error: true, result: "Crashed" };
     }
     return success("Hello.");
@@ -256,6 +281,83 @@ test("one message's files never go out with another conversation's answer, even 
   const replies = calls.filter(c => c.path.endsWith("/reply"));
   assert.equal(replies.length, 1);
   assert.deepEqual(replies[0].body, { text: "Hello." }, "no files");
+});
+
+test("two listeners answering at once keep their outboxes apart; one left behind long ago is cleared", async t => {
+  const env = await home(t);
+  const fs = require("node:fs");
+  const dir = workDir(env);
+  const a = messageOutbox(dir, "7d0c8a5e-0000-4000-8000-0000000000d1");
+  fs.writeFileSync(join(a.path, "mine.txt"), "A's");
+  const old = join(dir, "outbox", "7d0c8a5e-0000-4000-8000-0000000000d0");
+  fs.mkdirSync(old);
+  fs.utimesSync(old, new Date(Date.now() - 2 * 3_600_000), new Date(Date.now() - 2 * 3_600_000));
+  const b = messageOutbox(dir, "7d0c8a5e-0000-4000-8000-0000000000d2");
+  assert.notEqual(a.path, b.path);
+  assert.equal(fs.readFileSync(join(a.path, "mine.txt"), "utf8"), "A's", "another message's outbox in use is left alone");
+  assert.ok(!fs.existsSync(old), "an abandoned one is cleared");
+  assert.throws(() => messageOutbox(dir, "../escape"), /invalid message id/);
+});
+
+test("the reply always fits the reply API: a long answer is cut, and the note about files left out is bounded", () => {
+  const note = replyText("Answer.", Array.from({ length: 500 }, (_, i) => `file-${i}-${"x".repeat(40)}.csv`));
+  assert.match(note, /^Answer\.\n\n_\(Not sent: file-0-[\s\S]* and \d+ more\. Up to 10 files/);
+  assert.ok(note.length < 2_000);
+  const huge = replyText("y".repeat(40_000), ["a.bin"]);
+  assert.equal(huge.length <= 30_000, true);
+  assert.match(huge, /Cut short[\s\S]*Not sent: a\.bin/);
+  assert.equal(shortName("short.pdf"), "short.pdf");
+});
+
+test("Claude's raw output never reaches the chat when it stops without an answer", async () => {
+  // A tool use (with private input), then it stops: no result line.
+  const claude = fakeClaude(() => [toolUse("t1", "mcp__plugin_mnemio_mnemio__send_to_my_chat_app", { text: "secret plan" })]);
+  const e = await runClaude("hi", { bin: "claude", args: [], cwd: "/", spawnFn: claude.spawnFn }).catch(x => x);
+  assert.match(e.message, /Claude stopped without an answer \(exit code 0\)/);
+  assert.doesNotMatch(e.message, /secret/);
+});
+
+test("a character split between two chunks of Claude's output arrives whole", async () => {
+  const seen = [];
+  const claude = fakeClaude(() => [toolUse("t1", "Read", { file_path: "/w/inbox/Résumé — 2026.pdf" }), toolResult("t1"), success("Lu ✓")], { bytes: true });
+  const r = await runClaude("hi", { bin: "claude", args: [], cwd: "/", spawnFn: claude.spawnFn, onTool: e => seen.push(e) });
+  assert.equal(r.text, "Lu ✓");
+  assert.equal(seen[0].input.file_path, "/w/inbox/Résumé — 2026.pdf");
+});
+
+test("a failed answer is reported as failed, so Mnemio never takes it for the answer", async t => {
+  const env = await home(t);
+  const sent = [];
+  const request = async (url, opts) => {
+    if (url.pathname.endsWith("/next")) return Response.json(message("7d0c8a5e-0000-4000-8000-0000000000e1", "Hi"));
+    sent.push(JSON.parse(opts.body));
+    return Response.json({ delivered: "reply" });
+  };
+  const broken = fakeClaude(() => null);
+  const state = await run({ env, request, spawnFn: broken.spawnFn, once: true });
+  assert.equal(sent[0].failed, true);
+  assert.match(sent[0].text, /couldn't answer this: Claude stopped without an answer/);
+  assert.match(state.lastError, /exit code 1/);
+});
+
+test("step reports still on their way when the answer is ready hold it up briefly, and none go after it", async t => {
+  const env = await home(t);
+  const posted = [];
+  let release;
+  const request = async (url, opts) => {
+    posted.push(JSON.parse(opts.body));
+    if (posted.length === 1) await new Promise(r => { release = r; });
+    return Response.json({ ok: true });
+  };
+  const steps = stepReporter({ id: "7d0c8a5e-0000-4000-8000-0000000000f1" }, { env, request, flushMs: 50 });
+  steps.onTool({ id: "t1", name: "mcp__plugin_mnemio_mnemio__list_goals", input: {}, state: "started" });
+  steps.onTool({ id: "t1", state: "done" });
+  const started = Date.now();
+  await steps.flush();
+  assert.ok(Date.now() - started < 1_000, "the answer doesn't wait for a slow report");
+  release();
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(posted.length, 1, "the queued report is dropped once the answer went");
 });
 
 test("a step report that fails never holds the answer up", async t => {

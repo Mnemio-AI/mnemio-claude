@@ -3,7 +3,9 @@ import { basename } from "node:path";
 /**
  * What the listener's Claude is doing, in words, for the person's chat: each tool it uses becomes a step that Mnemio
  * shows live ("Searching memory", "Using mnemio-release-checklist", "Checking goals"), the way the hosted assistant's
- * steps are shown. Only a short label and a one-line preview leave this computer, never a tool's full input or output.
+ * steps are shown. Only a short label leaves this computer, and a preview only where it can't carry private text: a
+ * memory search's query and a file's name. Steps can show in a shared thread, so never a message being sent, an
+ * approval's details or any other tool input.
  */
 
 const MNEMIO_TOOL = /^mcp__plugin_mnemio_mnemio__(.+)$/;
@@ -33,12 +35,6 @@ const clip = s => {
 };
 /** "GMAIL_FETCH_EMAILS" / "fetch_emails" → "gmail fetch emails". */
 const words = name => String(name).replace(/^mcp__[^_]+(?:_[^_]+)*?__/, "").replace(/[_-]+/g, " ").trim().toLowerCase();
-/** A tool input's first short text field: what a step is about ("the rollout plan"), never the whole input. */
-const firstText = input => {
-  for (const key of ["query", "question", "message", "title", "skill", "name"]) if (typeof input?.[key] === "string") return input[key];
-  const any = Object.values(input ?? {}).find(v => typeof v === "string");
-  return any ?? "";
-};
 
 /** Claude Code's own plumbing (loading a tool's definition), not a step the person would care about. */
 const HIDDEN = new Set(["ToolSearch"]);
@@ -48,16 +44,16 @@ export function describeStep(name, input = {}) {
   if (HIDDEN.has(name)) return null;
   const mnemio = MNEMIO_TOOL.exec(name)?.[1];
   if (mnemio) {
-    if (/recall|memor/i.test(mnemio)) return { tool: "Searching memory", preview: clip(firstText(input)) };
+    if (/recall|memor/i.test(mnemio)) return { tool: "Searching memory", preview: clip(typeof input.query === "string" ? input.query : "") };
     if (mnemio === "call_connected_tool") return { tool: `Using ${words(input.tool || input.name || "a connected tool")}`, preview: "" };
-    return { tool: MNEMIO_WORDS[mnemio] || `Using ${words(mnemio)}`, preview: clip(firstText(input)) };
+    return { tool: MNEMIO_WORDS[mnemio] || `Using ${words(mnemio)}`, preview: "" };
   }
   // The apps the person connected in Mnemio (Gmail, Notion, …), through the plugin's MCP server too.
   if (/^mcp__/.test(name)) return { tool: `Using ${words(name)}`, preview: "" };
   if (name === "Skill") return { tool: `Using ${String(input.skill || input.command || "a skill").replace(/^\//, "")}`, preview: "" };
   if (name === "Read") return { tool: "Reading a file", preview: input.file_path ? basename(String(input.file_path)) : "" };
   if (name === "Write" || name === "Edit") return { tool: "Making a file", preview: input.file_path ? basename(String(input.file_path)) : "" };
-  if (name === "Glob" || name === "Grep") return { tool: "Looking through files", preview: clip(input.pattern) };
+  if (name === "Glob" || name === "Grep") return { tool: "Looking through files", preview: "" };
   if (name === "TodoWrite") return { tool: "Planning", preview: "" };
   // Not allowed in the listener (it is refused), but Claude may still try.
   if (name === "Bash") return { tool: "Running a command", preview: "" };

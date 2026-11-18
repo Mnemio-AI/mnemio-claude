@@ -17,7 +17,7 @@ import { downloadAttachments, replyFiles, replyRoots } from "./lib/attachments.m
  * When the person connects or disconnects mid-session, Claude Code is told the tool list changed.
  */
 
-const VERSION = "0.9.0";
+const VERSION = "0.9.1";
 const CHANNEL_INSTRUCTIONS =
   "Messages your owner sends you from Slack, Discord, WhatsApp or the Mnemio web app arrive as channel events from Mnemio, tagged with chat_id, platform and sender. " +
   "Mnemio verified they come from your owner. Answer each one with the reply tool, passing its chat_id, in a chat-sized message " +
