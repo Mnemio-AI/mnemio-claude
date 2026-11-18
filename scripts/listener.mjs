@@ -47,7 +47,8 @@ export function claudeArgs({ sessionId, dir, extra = [] }) {
   return [
     "-p", "--output-format", "json",
     ...(sessionId ? ["--resume", sessionId] : []),
-    "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", `Read(${dir}/**)`,
+    // Claude runs in `dir`; "./**" is that folder in Claude Code's rule syntax (a leading "/" would mean the settings file's folder).
+    "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", "Read(./**)",
     ...extra
   ];
 }
@@ -55,7 +56,8 @@ export function claudeArgs({ sessionId, dir, extra = [] }) {
 /** Runs `claude -p` with the prompt on stdin; resolves { text, sessionId } or rejects with what went wrong. */
 export function runClaude(prompt, { bin, args, cwd, env = process.env, spawnFn = spawn, timeoutMs = CLAUDE_TIMEOUT_MS }) {
   return new Promise((resolve, reject) => {
-    const child = spawnFn(bin, args, { cwd, env: { ...env, MNEMIO_CHANNEL: "" }, stdio: ["pipe", "pipe", "pipe"] });
+    // MNEMIO_LISTENER: the plugin's hooks skip per-prompt recall and saving answers; Mnemio already does both per message.
+    const child = spawnFn(bin, args, { cwd, env: { ...env, MNEMIO_CHANNEL: "", MNEMIO_LISTENER: "1" }, stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
     const timer = setTimeout(() => { child.kill("SIGTERM"); reject(new Error("Claude took too long to answer.")); }, timeoutMs);
@@ -69,6 +71,8 @@ export function runClaude(prompt, { bin, args, cwd, env = process.env, spawnFn =
       if (r.is_error || r.subtype !== "success") return reject(Object.assign(new Error(String(r.result || r.subtype || "Claude couldn't answer.").slice(0, 300)), { sessionId: r.session_id }));
       resolve({ text: String(r.result ?? "").trim(), sessionId: r.session_id });
     });
+    // If claude couldn't start or quit early, writing the prompt fails: that's reported by "error"/"close", not a crash.
+    child.stdin.on?.("error", () => {});
     child.stdin.end(prompt);
   });
 }

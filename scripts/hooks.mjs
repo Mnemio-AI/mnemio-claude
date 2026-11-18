@@ -71,6 +71,9 @@ async function autoConnect(startup, mode, env, request) {
 export async function handle(event, mode, env = process.env, request = fetch) {
   const startup = event.hook_event_name === "SessionStart";
   if (!isConnected(env)) return autoConnect(startup, mode, env, request);
+  // A listener's run: Mnemio recalled memory for the message and saves the exchange itself, so only the session start
+  // (settings, company skills) runs here.
+  if (env.MNEMIO_LISTENER === "1" && !startup) return;
   const config = await workspaceConfig({ env, request, refresh: startup && mode !== "reconcile" });
   const root = await syncProject(event, env, config?.prefs);
   const companySkills = env.MNEMIO_LOAD_SKILLS ? env.MNEMIO_LOAD_SKILLS === "1" : config?.prefs?.loadSkills !== false;

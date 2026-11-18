@@ -24,7 +24,7 @@ function fakeClaude(reply) {
     let input = "";
     child.stdin = { end: text => {
       input = text;
-      calls.push({ bin, args, cwd: opts.cwd, input, channel: opts.env.MNEMIO_CHANNEL });
+      calls.push({ bin, args, cwd: opts.cwd, input, channel: opts.env.MNEMIO_CHANNEL, listener: opts.env.MNEMIO_LISTENER });
       const r = reply(args, input);
       setImmediate(() => {
         child.stdout.emit("data", JSON.stringify(r));
@@ -40,7 +40,7 @@ function fakeClaude(reply) {
 const message = (id, text, conversation = "web:c1") => ({ id, conversation, platform: "web", sender: "Asha", text, context: [], memories: ["Asha ships on Fridays."], attachments: [] });
 
 test("claude runs with only Mnemio's tools, skills and reading its own folder", () => {
-  assert.deepEqual(claudeArgs({ dir: "/w", sessionId: "s1" }), ["-p", "--output-format", "json", "--resume", "s1", "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", "Read(/w/**)"]);
+  assert.deepEqual(claudeArgs({ dir: "/w", sessionId: "s1" }), ["-p", "--output-format", "json", "--resume", "s1", "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", "Read(./**)"]);
   assert.ok(!claudeArgs({ dir: "/w" }).includes("--resume"));
 });
 
@@ -68,6 +68,7 @@ test("answers each message with the person's own claude, one session per convers
   assert.equal(first.bin, "/usr/local/bin/claude");
   assert.equal(first.cwd, workDir(env));
   assert.equal(first.channel, "", "never collects messages itself");
+  assert.equal(first.listener, "1", "the plugin's hooks know it's the listener");
   assert.match(first.input, /What Mnemio remembers[\s\S]*Asha ships on Fridays[\s\S]*Asha wrote in the Mnemio web app:\nHow do we release\?[\s\S]*Your final message is sent to them as your reply/);
   assert.ok(!first.args.includes("--resume"));
   assert.deepEqual(sent[0], { path: "/api/claude/inbox/7d0c8a5e-0000-4000-8000-000000000001/reply", body: { text: "Answer 1" } });
@@ -128,4 +129,24 @@ test("with the workspace set by the company, the first session starts connecting
   (await import("node:fs")).rmSync(join(env.MNEMIO_CONFIG_DIR, "credentials.json"));
   const again = await handle(start, undefined, env, async () => assert.fail("no new request today"));
   assert.match(again.hookSpecificOutput.additionalContext, /run \/mnemio:connect/);
+});
+
+test("a claude that can't start is reported, not a crash", async () => {
+  const spawnFn = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = new EventEmitter();
+    child.stdin.end = () => setImmediate(() => { child.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })); child.emit("error", Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" })); });
+    child.kill = () => {};
+    return child;
+  };
+  await assert.rejects(runClaude("hi", { bin: "claude", args: [], cwd: "/", spawnFn }), /ENOENT/);
+});
+
+test("in a listener's run, the plugin's hooks leave recall and saving to Mnemio", async () => {
+  const env = { MNEMIO_URL: "https://acme.mnemio.ai", MNEMIO_TOKEN: "mnemio_cc_t", MNEMIO_LISTENER: "1", MNEMIO_SYNC_PROJECTS: "*", MNEMIO_CONFIG_DIR: tmpdir() + "/mnemio-listener-hooks" };
+  const none = async () => assert.fail("no call to Mnemio");
+  assert.equal(await handle({ hook_event_name: "UserPromptSubmit", cwd: tmpdir(), prompt: "hi" }, undefined, env, none), undefined);
+  assert.equal(await handle({ hook_event_name: "Stop", cwd: tmpdir(), last_assistant_message: "hello" }, undefined, env, none), undefined);
 });
