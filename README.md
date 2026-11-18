@@ -18,7 +18,7 @@ The plugin talks to Mnemio over HTTPS with its own sign-in; it never sees or sen
 curl -fsSL https://your-workspace.mnemio.ai/api/claude/install/<one-time code> | sh
 ```
 
-That's all. It installs this plugin, signs this computer in (its own sign-in, saved privately in `~/.config/mnemio/`), switches your Mnemio chats to your Claude, and asks whether your Claude should **answer your chats on this computer in the background** (yes by default). The Settings page turns green when it's done. The code works once, for 10 minutes; fetching the link alone (a chat app's link preview, say) never uses it.
+You need Node.js 22 or newer and Claude Code, installed and signed in. That's all. It installs this plugin, signs this computer in (its own sign-in, saved privately in `~/.config/mnemio/`), and asks whether your Claude should **answer your chats on this computer in the background** (yes by default). Mnemio then sends your Claude a test message; once it answers, your Mnemio chats switch to your Claude and the Settings page turns green. If the listener couldn't start, Settings says why instead, and your chats stay with your Mnemio assistant. The code works once, for 10 minutes; fetching the link alone (a chat app's link preview, say) never uses it.
 
 Already in Claude Code? This does the same, approving in the browser instead:
 
@@ -59,7 +59,7 @@ Once connected, your Mnemio chats — the web chat, Slack, Discord, WhatsApp, co
 
 Turned on by the install command, or with `/mnemio:listen on`. A small background service (a macOS launch agent or a Linux user service, started at login) collects each message and answers it with `claude -p` — your own Claude Code, signed in with your own plan — keeping one Claude session per conversation. No Claude Code window needs to be open. Messages can come from shared threads, so Claude only gets what answering needs: Mnemio's tools and company skills, reading the files that came with the message, and writing files to send you into that message's outbox. Each message's files are in a folder of their own, outside the folder Claude works in, granted to Claude for that message alone and removed once it's answered; no shell, no writing anywhere else, no web, and none of your other MCP servers or connectors — whatever your own Claude Code settings allow. While it works, each step it takes ("Searching memory", "Using mnemio-release-checklist") shows live in your chat, as with Mnemio's own assistant. Steps show only a label, plus a memory search's query or a file's name: never what's being sent or approved.
 
-`/mnemio:listen status` shows whether it's running; its log is in `~/.config/mnemio/listener/listener.log`.
+Besides collecting messages, it sends Mnemio a heartbeat every 30 seconds, so Settings → Claude shows each computer as **Answering** (even in the middle of a long answer), **Offline** (asleep, or not running), or **Sign in to Claude again** (Claude Code was signed out there: the listener takes no messages until you sign in, and they wait for it). `/mnemio:listen status` shows the same here; its log is in `~/.config/mnemio/listener/listener.log`.
 
 ### In a Claude Code session: channel mode
 

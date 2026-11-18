@@ -6,7 +6,7 @@ const require = createRequire(import.meta.url);
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { answerOne, claudeArgs, install, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, runClaude, shortName, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
+import { answerOne, claudeArgs, claudeSignIn, install, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, reportSetup, runClaude, shortName, startHeartbeat, status, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
 import { readCredentials } from "../scripts/lib/credentials.mjs";
@@ -120,11 +120,11 @@ test("the loop tells the person when their Claude couldn't answer, and waits for
     return Response.json({ delivered: "reply" });
   };
   const broken = fakeClaude(() => ({ type: "result", subtype: "error_during_execution", is_error: true, result: "Not logged in" }));
-  const state = await run({ env, request, spawnFn: broken.spawnFn, once: true });
+  const state = await run({ env, request, spawnFn: broken.spawnFn, once: true, signIn: async () => "ok" });
   assert.match(sent[0].text, /couldn't answer this: Not logged in/);
   assert.equal(state.lastError, "Not logged in");
 
-  const nobody = await run({ env: { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }, request, once: true });
+  const nobody = await run({ env: { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }, request, once: true, signIn: async () => "ok" });
   assert.match(nobody.lastError, /mnemio:connect/);
 });
 
@@ -401,7 +401,7 @@ test("a failed answer is reported as failed, so Mnemio never takes it for the an
     return Response.json({ delivered: "reply" });
   };
   const broken = fakeClaude(() => null);
-  const state = await run({ env, request, spawnFn: broken.spawnFn, once: true });
+  const state = await run({ env, request, spawnFn: broken.spawnFn, once: true, signIn: async () => "ok" });
   assert.equal(sent[0].failed, true);
   assert.match(sent[0].text, /couldn't answer this: Claude stopped without an answer/);
   assert.match(state.lastError, /exit code 1/);
@@ -467,7 +467,7 @@ test("when Claude stops mid-way, the failure says how its steps ended: unfinishe
     return Response.json({ ok: true });
   };
   const claude = fakeClaude(() => [toolUse("t1", "mcp__plugin_mnemio_mnemio__list_goals", {}), toolResult("t1"), toolUse("t2", "Read", { file_path: "/x/a.pdf" })]);
-  await run({ env, request, spawnFn: claude.spawnFn, once: true });
+  await run({ env, request, spawnFn: claude.spawnFn, once: true, signIn: async () => "ok" });
   const failure = sent.find(s => s.path.endsWith("/reply")).body;
   assert.equal(failure.failed, true);
   assert.deepEqual(failure.steps, [{ step: "t2", state: "failed" }], "the cut-off step is failed; the finished one was already confirmed");
@@ -491,7 +491,7 @@ test("where the company manages Claude Code's MCP servers, the listener takes no
   const managed = join(env.MNEMIO_CONFIG_DIR, "managed-mcp.json");
   require("node:fs").writeFileSync(managed, "{}");
   const request = async () => assert.fail("no message is collected");
-  const state = await run({ env, request, once: true, managedPaths: [managed] });
+  const state = await run({ env, request, once: true, signIn: async () => "ok", managedPaths: [managed] });
   assert.match(state.lastError, /company manages Claude Code's MCP servers/);
 });
 
@@ -508,4 +508,78 @@ test("a first attempt's unfinished steps end as failed even when the retry answe
   const answer = calls.find(c => c.path.endsWith("/reply")).body;
   assert.deepEqual(answer.steps, [{ step: "t1", state: "failed" }]);
   assert.ok(!calls.some(c => c.path.endsWith("/progress") && c.body.step === ""), "a step without an id isn't reported");
+});
+
+test("signed out of Claude Code: the person is told so, and the listener collects nothing until they sign in again", async t => {
+  const env = await home(t);
+  const sent = [];
+  let polls = 0;
+  const request = async (url, opts) => {
+    if (url.pathname.endsWith("/next")) {
+      polls++;
+      return Response.json(message("7d0c8a5e-0000-4000-8000-0000000000f1", "Hi"));
+    }
+    sent.push(JSON.parse(opts.body));
+    return Response.json({ delivered: "reply" });
+  };
+  const broken = fakeClaude(() => ({ type: "result", subtype: "error_during_execution", is_error: true, result: "Invalid API key · Please run /login" }));
+  let signedIn = "ok";
+  const signIn = async () => signedIn;
+  // It says "ok" at the start; the answer fails for want of a sign-in, and the check then says so.
+  const first = run({ env, request, spawnFn: broken.spawnFn, once: true, signIn: async () => { const s = signedIn; signedIn = "signed_out"; return s; } });
+  const state = await first;
+  assert.equal(state.claude, "signed_out");
+  assert.match(sent[0].text, /signed out on .+ Open Claude Code there and sign in again/);
+  assert.equal(sent[0].failed, true);
+  // Still signed out: nothing is collected (the message would only fail).
+  const idle = await run({ env, request, once: true, signIn });
+  assert.equal(polls, 1);
+  assert.match(idle.lastError, /signed out/);
+  // An error that isn't about signing in is passed on as it is.
+  signedIn = "ok";
+  const other = fakeClaude(() => ({ type: "result", subtype: "error_max_turns", is_error: true, result: "Too many turns" }));
+  await run({ env, request, spawnFn: other.spawnFn, once: true, signIn });
+  assert.match(sent.at(-1).text, /couldn't answer this: Too many turns/);
+});
+
+test("claude auth status: signed in, signed out (even with a failing exit), or unknown on an older Claude Code", async () => {
+  const settings = { claude: "/bin/claude", env: {} };
+  const reply = (err, stdout) => ({ execFn: (bin, args, opts, cb) => { assert.deepEqual(args, ["auth", "status", "--json"]); cb(err, stdout); } });
+  assert.equal(await claudeSignIn(settings, reply(null, JSON.stringify({ loggedIn: true, email: "a@b.c" }))), "ok");
+  assert.equal(await claudeSignIn(settings, reply(Object.assign(new Error("exit 1"), { code: 1 }), JSON.stringify({ loggedIn: false }))), "signed_out");
+  assert.equal(await claudeSignIn(settings, reply(new Error("unknown command 'auth'"), "")), "unknown");
+});
+
+test("the heartbeat goes out on its own, while an answer is still being worked on, and says how the listener is", async t => {
+  const env = await home(t);
+  const beats = [];
+  const request = async (url, opts) => {
+    assert.equal(url.pathname, "/api/claude/listener/heartbeat");
+    beats.push(JSON.parse(opts.body));
+    return Response.json({ ok: true, every: 30 });
+  };
+  const state = { claude: "ok", busy: true, lastError: null };
+  const stop = startHeartbeat(state, { env, request, every: 20, version: "9.9.9" });
+  await new Promise(r => setTimeout(r, 70));
+  stop();
+  assert.ok(beats.length >= 3, `beats: ${beats.length}`);
+  assert.deepEqual(beats[0], { version: "9.9.9", claude: "ok", busy: true, error: null });
+  const n = beats.length;
+  await new Promise(r => setTimeout(r, 40));
+  assert.equal(beats.length, n, "stopped");
+  // The local status goes by the heartbeat too: busy for minutes, still running.
+  assert.deepEqual([status({ env }).running, status({ env }).busy], [true, true]);
+});
+
+test("setting the listener up is reported to Mnemio, and a failure says what went wrong", async t => {
+  const env = await home(t);
+  const sent = [];
+  const request = async (url, opts) => {
+    sent.push({ path: url.pathname, body: JSON.parse(opts.body) });
+    return Response.json({ ok: true });
+  };
+  await reportSetup("installed", undefined, { env, request });
+  await reportSetup("failed", "Couldn't find the claude command.", { env, request });
+  assert.deepEqual(sent, [{ path: "/api/claude/listener/setup", body: { install: "installed" } }, { path: "/api/claude/listener/setup", body: { install: "failed", error: "Couldn't find the claude command." } }]);
+  await reportSetup("off", undefined, { env, request: async () => { throw new Error("offline"); } });
 });
