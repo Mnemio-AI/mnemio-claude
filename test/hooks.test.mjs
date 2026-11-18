@@ -8,11 +8,12 @@ import { handle, syncProject } from "../scripts/hooks.mjs";
 async function setup(t) {
   const cwd = await realpath(await mkdtemp(join(tmpdir(), "mnemio-project-")));
   t.after(() => rm(cwd, { recursive: true, force: true }));
-  const env = { MNEMIO_SYNC_PROJECT: cwd, MNEMIO_URL: "http://localhost:8787", MNEMIO_TOKEN: "test", CLAUDE_PLUGIN_DATA: join(cwd, "data"), MNEMIO_CONFIG_DIR: join(cwd, "config-home") };
+  const env = { MNEMIO_SYNC_PROJECT: cwd, MNEMIO_URL: "http://localhost:8787", MNEMIO_TOKEN: "test", CLAUDE_PLUGIN_DATA: join(cwd, "data"), MNEMIO_CONFIG_DIR: join(cwd, "config-home"), MNEMIO_SKILLS_DIR: join(cwd, "skills-home") };
   const calls = [];
   const request = async (url, opts) => {
     // Reading the person's settings from Mnemio isn't a sync call.
     if (url.pathname === "/api/claude/config") return Response.json({ workspace: "Acme", prefs: {} });
+    if (url.pathname === "/api/claude/skills/_bundle") return Response.json({ hash: "none", skills: [] });
     calls.push({ path: url.pathname, data: opts.body && JSON.parse(opts.body) });
     return Response.json({ hash: "a".repeat(64), skills: ["deploy"], facts: ["Use staging first."] });
   };

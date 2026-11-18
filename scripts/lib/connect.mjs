@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { hostname } from "node:os";
 import { forgetCredentials, forgetPending, readCredentials, readPending, saveCredentials, savePending } from "./credentials.mjs";
+import { removeSkills } from "./skills-install.mjs";
 
 /**
  * /mnemio:connect: sign in by approving in the browser (no token to copy). Asks the workspace for a short code,
@@ -90,5 +91,7 @@ export async function disconnect({ env = process.env, request = fetch } = {}) {
     // Offline: forget it here anyway; it can also be signed out in Mnemio → Settings → Claude.
   }
   forgetCredentials(env);
-  return { disconnected: true, workspace: c.workspace || c.url };
+  // The company's skills belong to the workspace: they go with the sign-in.
+  const { removed } = await removeSkills({ env }).catch(() => ({ removed: 0 }));
+  return { disconnected: true, workspace: c.workspace || c.url, ...(removed && { companySkillsRemoved: removed }) };
 }

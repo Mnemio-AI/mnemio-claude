@@ -2,6 +2,7 @@ import { callMnemio, mnemioConfig } from "./http.mjs";
 import { downloadAttachments, replyFiles, replyRoots } from "./attachments.mjs";
 import { connect, disconnect } from "./connect.mjs";
 import { workspaceConfig } from "./config.mjs";
+import { installedSkills } from "./skills-install.mjs";
 import { realpath } from "node:fs/promises";
 
 const ID = /^[0-9a-f-]{36}$/;
@@ -78,7 +79,7 @@ export async function run(action, input, env = process.env, request = fetch, arg
     case "status": {
       const config = await workspaceConfig({ env, request, refresh: true });
       if (!config) return { connected: false, message: "Not connected: run /mnemio:connect <your workspace address>." };
-      return { connected: true, workspace: config.workspace, url: config.url, as: config.user, syncs: config.prefs.syncAll ? "every project" : config.prefs.projects, loadsSkills: config.prefs.loadSkills, answersChats: config.answersChats };
+      return { connected: true, workspace: config.workspace, url: config.url, as: config.user, syncs: config.prefs.syncAll ? "every project" : config.prefs.projects, loadsSkills: config.prefs.loadSkills, companySkillsInstalled: (await installedSkills(env)).length, answersChats: config.answersChats };
     }
     case "sync-here":
     case "stop-sync-here": {

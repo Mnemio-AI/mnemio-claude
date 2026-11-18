@@ -23,7 +23,7 @@ In Claude Code:
 The last one opens your Mnemio workspace in the browser with a short code. Check the code and press **Approve**: this computer gets its own sign-in, saved privately in `~/.config/mnemio/`. Nothing to copy or export. **Mnemio → Settings → Claude** shows the same three lines with copy buttons, every Claude you connected (sign any one out), and what the plugin does:
 
 - **What syncs back:** every project, or the ones you add by running `/mnemio:sync-here` inside them.
-- **Company skills at the start of each session:** on by default.
+- **Company skills installed in Claude Code:** on by default. Every skill you receive in Mnemio (official, shared with you, your assistant's) becomes a Claude Code skill in `~/.claude/skills/mnemio-<name>/`, kept up to date at each session start. Turning it off, or `/mnemio:disconnect`, removes them; the plugin never touches other skill folders.
 
 | Command | What it does |
 | --- | --- |
@@ -65,16 +65,14 @@ Claude Code channels are a research preview. Until this plugin is on Anthropic's
 
 Mnemio starts a Claude cloud session on your plan whenever a message arrives, using a scheduled task you create. Mnemio keeps only that task's trigger token, which can start that one task and nothing else.
 
-1. **Cloud environment** (claude.ai/code → environment settings): create one for Mnemio.
-   - **Network access:** Limited, and add your Mnemio host (e.g. `your-workspace.mnemio.ai`) under **Allowed domains**.
-   - **Environment variables:** `MNEMIO_URL=https://your-workspace.mnemio.ai`.
-   - **Network secrets:** add a secret of type **Bearer** for your Mnemio host. For its value, create a token in Mnemio → Settings → Claude → **Add a token by hand** (call it "Cloud mode"). Anthropic's proxy adds it to requests for that host, so the token never enters the session.
-2. **Scheduled task** (claude.ai → Scheduled tasks → New):
-   - **Repository:** your fork of [Mnemio-AI/mnemio-claude](https://github.com/Mnemio-AI/mnemio-claude) (or any repository of yours that contains this plugin, at its root or in a `mnemio-claude` folder).
-   - **Environment:** the one from step 1.
-   - **Prompt:** the contents of [`cloud/scheduled-task-prompt.md`](cloud/scheduled-task-prompt.md).
-   - **Trigger:** add an **API** trigger and **Generate token**. Copy the URL and the token (it's shown once). A schedule is optional: an hourly one works as a safety net.
-3. In **Mnemio → Settings → Claude → Cloud mode**, paste the URL and token and press **Test**. You should see a run start in Claude.
+**Mnemio → Settings → Claude → Cloud mode** walks you through it with every value ready to copy, and ticks each step off:
+
+1. Fork this repository (the cloud run works in it).
+2. Create a token for the cloud run.
+3. In claude.ai/code, create a cloud environment: network access **Limited** with your Mnemio host allowed, `MNEMIO_URL` as an environment variable, and the token as a **Bearer** network secret for that host (Anthropic's proxy adds it to requests for that host only; it never enters the session).
+4. Create a scheduled task on your fork in that environment, with the prompt *"Follow the instructions in cloud/scheduled-task-prompt.md in this repository."*, and add an **API** trigger (Generate token).
+5. Paste the trigger's URL and token into Mnemio.
+6. Press **Test**: Mnemio sends your cloud Claude a short message and shows when it answers.
 
 A burst of messages starts one run, which answers all of them. Anthropic allows 100 API-started runs an hour per account, and each run counts toward your Claude plan's usage.
 
@@ -82,7 +80,7 @@ A burst of messages starts one run, which answers all of them. Anthropic allows 
 
 | Piece | What it does |
 | --- | --- |
-| `hooks/hooks.json` | SessionStart: catalog and retry of anything unsent. UserPromptSubmit: recall. PostToolUse: sync memory files and project skills. Stop: save the answer. |
+| `hooks/hooks.json` | SessionStart: settings from Mnemio, company skills installed, retry of anything unsent. UserPromptSubmit: recall. PostToolUse: sync memory files and project skills. Stop: save the answer. |
 | `scripts/brain.mjs` | The client Claude runs: `skills`, `skill <name>`, `recall`, `save`, `inbox`, `reply <id> [--file path]`, `tools`, `tool <name>`. |
 | `scripts/channel.mjs` | That server: Mnemio's tools, and when listening, your messages with a `reply` tool. |
 | `commands/` | `/mnemio:connect`, `status`, `sync-here`, `disconnect`. |

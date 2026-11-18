@@ -4,6 +4,7 @@ import { realpath } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { callMnemio, isConnected } from "./lib/http.mjs";
 import { workspaceConfig } from "./lib/config.mjs";
+import { installSkills, removeSkills, skillsInstalled } from "./lib/skills-install.mjs";
 import { run } from "./lib/commands.mjs";
 import { changedSkill, projectSkills, readDocument, syncSkill } from "./lib/project-skills.mjs";
 import { digest, syncDirectory, retain, retry } from "./lib/outbox.mjs";
@@ -43,11 +44,21 @@ export async function handle(event, mode, env = process.env, request = fetch) {
   }
   const config = await workspaceConfig({ env, request, refresh: startup && mode !== "reconcile" });
   const root = await syncProject(event, env, config?.prefs);
+  const companySkills = env.MNEMIO_LOAD_SKILLS ? env.MNEMIO_LOAD_SKILLS === "1" : config?.prefs?.loadSkills !== false;
   if (startup && mode !== "reconcile") {
-    const load = env.MNEMIO_LOAD_SKILLS ? env.MNEMIO_LOAD_SKILLS === "1" : config?.prefs?.loadSkills !== false;
-    return run("session-start", "", { ...env, MNEMIO_LOAD_SKILLS: load || root ? "1" : "0" }, request);
+    // Installed company skills are already Claude Code skills; the catalog is only for a first session before that.
+    const catalog = companySkills && !(await skillsInstalled(env));
+    return run("session-start", "", { ...env, MNEMIO_LOAD_SKILLS: catalog ? "1" : "0" }, request);
   }
-  if (!root) return;
+  const failures = [];
+  if (startup && mode === "reconcile") {
+    // In the background at every start: company skills as files in ~/.claude/skills (or taken out when switched off).
+    try { companySkills ? await installSkills({ env, request }) : await removeSkills({ env }); } catch (e) { failures.push("company skills: " + e.message); }
+  }
+  if (!root) {
+    if (failures.length) throw new Error(failures.join("\n"));
+    return;
+  }
   const call = (path, data, timeout) => callMnemio(path, data, { env, request, timeout });
   const save = payload => call("memory", payload);
   async function upload(name) {
@@ -55,7 +66,6 @@ export async function handle(event, mode, env = process.env, request = fetch) {
   }
 
   if (startup && mode === "reconcile") {
-    const failures = [];
     try { await retry(syncDirectory(env, root, "pending"), save); } catch (e) { failures.push(e.message); }
     for (const name of await projectSkills(root)) {
       try { await upload(name); } catch (e) { failures.push(name + ": " + e.message); }
