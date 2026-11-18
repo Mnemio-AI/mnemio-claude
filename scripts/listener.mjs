@@ -174,7 +174,8 @@ export function stepReporter(m, { env = process.env, request = fetch, flushMs = 
         post({ step, tool: ids.get(e.id), state: e.state });
       }
     },
-    unconfirmed: () => [...ends].map(([step, state]) => ({ step, state })),
+    /** At most 100 (what Mnemio keeps), failed ones first: those must never show as done. */
+    unconfirmed: () => [...ends].map(([step, state]) => ({ step, state })).sort((a, b) => (a.state === "failed" ? 0 : 1) - (b.state === "failed" ? 0 : 1)).slice(0, 100),
     flush: async () => {
       await Promise.race([chain, new Promise(r => setTimeout(r, flushMs))]);
       closed = true;
@@ -182,13 +183,17 @@ export function stepReporter(m, { env = process.env, request = fetch, flushMs = 
   };
 }
 
-/** A real directory at `path` (made if missing); a link there is removed first, never followed. */
+/**
+ * A real directory at `path`, made if missing; a link (or a file) there is removed first, never followed. Anything
+ * that can't be removed stops here, before a caller clears what's inside.
+ */
 function realDir(path) {
-  try {
-    const s = lstatSync(path);
-    if (s.isSymbolicLink() || !s.isDirectory()) rmSync(path, { force: true, recursive: !s.isSymbolicLink() });
-  } catch {}
-  mkdirSync(path, { recursive: true, mode: 0o700 });
+  let s = null;
+  try { s = lstatSync(path); } catch (e) { if (e.code !== "ENOENT") throw e; }
+  if (s && (s.isSymbolicLink() || !s.isDirectory())) rmSync(path, { force: true });
+  mkdirSync(path, { mode: 0o700, recursive: true });
+  const now = lstatSync(path);
+  if (now.isSymbolicLink() || !now.isDirectory()) throw new Error(`${path} isn't a folder the listener can use.`);
 }
 
 /**
@@ -198,8 +203,10 @@ function realDir(path) {
  */
 export function messageFolder(dir, id) {
   if (!/^[0-9a-f-]{36}$/.test(String(id))) throw new Error("Mnemio sent an invalid message id.");
+  // The listener's own folder may be a link (kept on another disk, say): it's used as it is. Only messages/ itself,
+  // whose contents are cleared, must be a real folder.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const root = join(dir, MESSAGES);
-  realDir(dir);
   realDir(root);
   for (const e of readdirSync(root, { withFileTypes: true })) {
     const p = join(root, e.name);
@@ -218,6 +225,25 @@ const cut = (s, n) => {
   const head = s.slice(0, n);
   return /[\uD800-\uDBFF]$/.test(head) ? head.slice(0, -1) : head;
 };
+
+/**
+ * The fence of a Markdown code block still open at the end of `text` (to close it with), or "". A block ends only
+ * at a fence of the same character, at least as long, with nothing after it (CommonMark): a "```" line inside a
+ * "````" example doesn't end it.
+ */
+export function openFence(text) {
+  let open = null;
+  for (const line of text.split("\n")) {
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!m) continue;
+    const [, fence, rest] = m;
+    if (!open) {
+      // An opening "```" fence's info string can't contain a backtick.
+      if (fence[0] === "~" || !rest.includes("`")) open = fence;
+    } else if (fence[0] === open[0] && fence.length >= open.length && !rest.trim()) open = null;
+  }
+  return open ? open[0].repeat(open.length) : "";
+}
 
 /** A name the reply API takes (at most FILE_NAME_LIMIT characters), keeping the extension. */
 export function shortName(name) {
@@ -282,15 +308,16 @@ export function replyText(answer, skipped = []) {
   const room = REPLY_TEXT_LIMIT - note.length;
   if (answer.length <= room) return answer + note;
   // Cut inside a code block, close it: otherwise the notices (and the file links Mnemio adds) would show as code.
-  let head = cut(answer, room - notice.length - 4);
-  if ((head.match(/^```/gm) ?? []).length % 2) head += "\n```";
+  let head = cut(answer, room - notice.length - 12);
+  const open = openFence(head);
+  if (open) head += "\n" + open;
   return head + notice + note;
 }
 
 /** Answers one collected message; returns what was sent. */
 export async function answerOne(m, { env = process.env, request = fetch, spawnFn = spawn, settings = listenerSettings(env) } = {}) {
   const dir = workDir(env);
-  realDir(dir);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   // Earlier versions kept every message's files in the working folder (inbox/, outbox/): gone, so none stay readable.
   for (const old of ["inbox", "outbox"]) rmSync(join(dir, old), { recursive: true, force: true });
   let box = messageFolder(listenerDir(env), m.id);

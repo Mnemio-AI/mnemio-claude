@@ -6,7 +6,7 @@ const require = createRequire(import.meta.url);
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { answerOne, claudeArgs, install, listenerDir, messageFolder, replyText, run, runClaude, shortName, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
+import { answerOne, claudeArgs, install, listenerDir, messageFolder, openFence, replyText, run, runClaude, shortName, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
 import { readCredentials } from "../scripts/lib/credentials.mjs";
@@ -320,6 +320,17 @@ test("a messages folder that is a link is removed, never followed and cleared", 
   assert.ok(!fs.lstatSync(join(dir, "messages")).isSymbolicLink());
 });
 
+test("a listener folder kept elsewhere through a link stays a link", async t => {
+  const env = await home(t);
+  const fs = require("node:fs");
+  const disk = join(env.MNEMIO_CONFIG_DIR, "other-disk");
+  fs.mkdirSync(disk);
+  fs.symlinkSync(disk, listenerDir(env));
+  const box = messageFolder(listenerDir(env), "7d0c8a5e-0000-4000-8000-0000000000d4");
+  assert.ok(fs.lstatSync(listenerDir(env)).isSymbolicLink(), "the link is left as it is");
+  assert.ok(box.base.startsWith(fs.realpathSync(disk)));
+});
+
 test("the reply always fits the reply API: a long answer is cut, and the note about files left out is bounded", () => {
   const note = replyText("Answer.", Array.from({ length: 500 }, (_, i) => `file-${i}-${"x".repeat(40)}.csv`));
   assert.match(note, /^Answer\.\n\n_\(Not sent: file-0-[\s\S]* and \d+ more\. Up to 10 files/);
@@ -332,6 +343,14 @@ test("the reply always fits the reply API: a long answer is cut, and the note ab
   const code = replyText("Here:\n```\n" + "line\n".repeat(8_000), []);
   assert.ok(code.length <= 30_000);
   assert.match(code, /\n```\n\n_\(Cut short/);
+  // A "```" line inside a "````" example doesn't end it; only a fence still open at the cut is closed, with its own kind.
+  assert.equal(openFence("````md\n```js\nx\n```\n````\nprose"), "");
+  assert.equal(openFence("text\n````md\n```js\nx\n```"), "````");
+  assert.equal(openFence("~~~\nx"), "~~~");
+  const nested = replyText("Example:\n````md\n```js\n" + "y\n".repeat(20_000), []);
+  assert.match(nested, /\n````\n\n_\(Cut short/);
+  const closed = replyText("````md\n```\nz\n```\n````\n" + "w".repeat(40_000), []);
+  assert.doesNotMatch(closed, /```\n\n_\(Cut short/, "nothing to close: no stray fence");
   // Never half of a character (an emoji is two UTF-16 units).
   assert.doesNotMatch(shortName("😀".repeat(80) + ".png"), /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
   assert.doesNotMatch(replyText("x" + "😀".repeat(20_000)), /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
@@ -384,6 +403,14 @@ test("step reports still on their way when the answer is ready hold it up briefl
   await steps.flush();
   assert.ok(Date.now() - started < 1_000, "the answer doesn't wait for a slow report");
   assert.deepEqual(steps.unconfirmed(), [{ step: "t1", state: "done" }], "how it ended goes with the answer instead");
+  // At most what Mnemio keeps, failed ones first.
+  for (let i = 0; i < 150; i++) {
+    steps.onTool({ id: `x${i}`, name: "Read", input: {}, state: "started" });
+    steps.onTool({ id: `x${i}`, state: i === 149 ? "failed" : "done" });
+  }
+  const ends = steps.unconfirmed();
+  assert.equal(ends.length, 100);
+  assert.deepEqual(ends[0], { step: "x149", state: "failed" });
   release();
   await new Promise(r => setTimeout(r, 20));
   assert.equal(posted.length, 1, "the queued report is dropped once the answer went");
