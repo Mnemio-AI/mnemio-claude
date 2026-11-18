@@ -5,6 +5,8 @@ Connects Claude to your Mnemio company brain. Everything runs on **your own Clau
 - **Company skills and memory in Claude Code:** relevant memories are recalled before each prompt, company skills can be read on demand, and Claude can save notes.
 - **Sync back to Mnemio** (in the project you opt in): your memory files, your project's `.claude/skills`, and each answer go to your Mnemio memory, where the workspace's sharing rules apply.
 - **Your Slack, Discord and WhatsApp messages answered by your own Claude**, either by a Claude Code session on your computer (channel mode) or by a Claude cloud session that Mnemio starts for you (cloud mode, no computer needed).
+- **Mnemio's tools in your Claude:** colleague requests, approvals, goals, knowledge sync, messaging your chat apps, the company's connected MCP servers, and the apps you connected in Mnemio (Gmail, Notion, …) — the same tools the hosted Mnemio assistant has.
+- **Chat with your Claude from the Mnemio web app** (**My Claude** in the sidebar): your Claude collects those messages the same way, through the channel or a cloud run.
 
 Requires Node.js 22+. The plugin talks to Mnemio over HTTPS with a personal token; it never sees or sends a Claude login.
 
@@ -73,11 +75,12 @@ A burst of messages starts one run, which answers all of them. Anthropic allows 
 | Piece | What it does |
 | --- | --- |
 | `hooks/hooks.json` | SessionStart: catalog and retry of anything unsent. UserPromptSubmit: recall. PostToolUse: sync memory files and project skills. Stop: save the answer. |
-| `scripts/brain.mjs` | The client Claude runs: `skills`, `skill <name>`, `recall`, `save`, `inbox`, `reply <id>`. |
+| `scripts/brain.mjs` | The client Claude runs: `skills`, `skill <name>`, `recall`, `save`, `inbox`, `reply <id> [--file path]`, `tools`, `tool <name>`. |
 | `scripts/channel.mjs` | The channel (an MCP server on stdio): long-polls Mnemio for your messages and gives Claude a `reply` tool. |
+| `.mcp.json` | The channel, plus `mnemio-tools` (Mnemio's tools and connected MCP servers) and `mnemio-apps` (your connected apps), both over HTTPS with your token. |
 | `cloud/scheduled-task-prompt.md` | What a cloud run does: collect, answer, repeat until the inbox is empty. |
 
-The HTTP API is under `/api/claude/` on your Mnemio workspace, always with your personal token: `GET skills`, `GET skills/:name`, `POST skills`, `POST recall`, `POST memory`, `GET inbox/next`, `POST inbox/claim`, `POST inbox/:id/reply`. Revoke the token in Mnemio → Settings → Claude.
+The HTTP API is under `/api/claude/` on your Mnemio workspace, always with your personal token: `GET skills`, `GET skills/:name`, `POST skills`, `POST recall`, `POST memory`, `GET inbox/next`, `POST inbox/claim`, `GET inbox/:id/files/:fileId`, `POST inbox/:id/reply`, and the MCP endpoints `mcp` (Mnemio's tools) and `apps/mcp` (connected apps). Revoke the token in Mnemio → Settings → Claude.
 
 ## Development
 

@@ -1,7 +1,22 @@
-import { callMnemio } from "./http.mjs";
+import { callMnemio, mnemioConfig } from "./http.mjs";
 import { downloadAttachments, replyFiles, replyRoots } from "./attachments.mjs";
 
 const ID = /^[0-9a-f-]{36}$/;
+
+/** One JSON-RPC call to Mnemio's stateless MCP endpoint (it answers with plain JSON). */
+async function mcpCall(rpc, env, request) {
+  const { url, token } = mnemioConfig(env);
+  const response = await request(new URL("/api/claude/mcp", url), {
+    method: "POST",
+    headers: { ...(token && { authorization: "Bearer " + token }), "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, ...rpc }),
+    redirect: "error",
+    signal: AbortSignal.timeout(120000)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.error) throw new Error(`Mnemio tools: ${body.error?.message || body.error || "HTTP " + response.status}`);
+  return body.result;
+}
 
 export async function run(action, input, env = process.env, request = fetch, arg, files = []) {
   const startup = action === "session-start";
@@ -40,8 +55,20 @@ export async function run(action, input, env = process.env, request = fetch, arg
         if (attached.length) body.files = attached;
       }
       break;
+    // Mnemio's tools (colleague requests, approvals, goals, knowledge sync, connected MCP servers) without MCP:
+    // the same endpoint the plugin's mnemio-tools server uses, for cloud runs and scripts.
+    case "tools":
+      return mcpCall({ method: "tools/list" }, env, request).then(r => ({ tools: r.tools.map(t => ({ name: t.name, description: t.description, input: t.inputSchema })) }));
+    case "tool": {
+      if (!/^[a-z0-9_]{1,64}$/.test(arg || "")) throw new Error("Name the tool: tool <name>, with its JSON input on stdin.");
+      let args = {};
+      if (input) {
+        try { args = JSON.parse(input); } catch { throw new Error("The tool's input on stdin must be JSON."); }
+      }
+      return mcpCall({ method: "tools/call", params: { name: arg, arguments: args } }, env, request);
+    }
     default:
-      throw new Error("Choose skills, skill, recall, save, inbox or reply.");
+      throw new Error("Choose skills, skill, recall, save, inbox, reply, tools or tool.");
   }
   const result = await callMnemio(path, body, { env, request, timeout: startup ? 3000 : 65000 });
   // Files that came with chat messages are saved locally, and each message lists where.

@@ -8,6 +8,16 @@
         "MNEMIO_TOKEN": "${MNEMIO_TOKEN:-}",
         "MNEMIO_CHANNEL": "${MNEMIO_CHANNEL:-}"
       }
+    },
+    "mnemio-tools": {
+      "type": "http",
+      "url": "${MNEMIO_URL:-http://localhost:8787}/api/claude/mcp",
+      "headers": { "Authorization": "Bearer ${MNEMIO_TOKEN:-}" }
+    },
+    "mnemio-apps": {
+      "type": "http",
+      "url": "${MNEMIO_URL:-http://localhost:8787}/api/claude/apps/mcp",
+      "headers": { "Authorization": "Bearer ${MNEMIO_TOKEN:-}" }
     }
   }
 }

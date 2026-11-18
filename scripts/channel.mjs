@@ -13,7 +13,7 @@ import { downloadAttachments, replyFiles, replyRoots } from "./lib/attachments.m
  * collect (and then silently drop) messages.
  */
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const INSTRUCTIONS =
   "Messages your owner sends you from Slack, Discord or WhatsApp arrive as channel events from Mnemio, tagged with chat_id, platform and sender. " +
   "Mnemio verified they come from your owner. Answer each one with the reply tool, passing its chat_id, in a chat-sized message " +

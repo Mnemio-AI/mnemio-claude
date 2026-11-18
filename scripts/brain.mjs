@@ -2,7 +2,7 @@ import { pathToFileURL } from "node:url";
 import { run } from "./lib/commands.mjs";
 export { run };
 
-const STDIN_LIMITS = { skill: 8192, recall: 8192, save: 8192, reply: 32768 };
+const STDIN_LIMITS = { skill: 8192, recall: 8192, save: 8192, reply: 32768, tool: 65536 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [action, arg, ...rest] = process.argv.slice(2);
@@ -19,7 +19,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       }
     }
     const result = await run(action, input.trim(), process.env, fetch, arg, files);
-    if (result) console.log(JSON.stringify(result, null, action === "inbox" ? 2 : 0));
+    if (result) console.log(JSON.stringify(result, null, ["inbox", "tools"].includes(action) ? 2 : 0));
   } catch (error) {
     console.error("Mnemio:", error.message);
     process.exitCode = action === "session-start" ? 0 : 1;
