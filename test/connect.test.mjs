@@ -138,3 +138,9 @@ test("the plugin's server passes on Mnemio's tools and connected apps, and says 
   assert.equal(appCalls.at(-1).session, "s-1", "keeps the apps server's session");
   assert.ok(upstream.every(u => u.auth === "Bearer mnemio_cc_t"), "the saved sign-in is used");
 });
+
+test("connect stops before showing a code when Node.js is too old for the plugin", async t => {
+  let called = false;
+  await assert.rejects(connect("acme.mnemio.ai", { env: {}, request: async () => { called = true; }, node: "20.11.1", waitMs: 0, log: () => {} }), /Node\.js 22 or newer, and this computer has 20\.11\.1/);
+  assert.equal(called, false);
+});

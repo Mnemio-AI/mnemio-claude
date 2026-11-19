@@ -12,20 +12,25 @@ The plugin talks to Mnemio over HTTPS with its own sign-in; it never sees or sen
 
 ## Set up
 
-**In Mnemio → Settings → Claude, press Connect Claude Code** and paste the command it shows into a terminal:
+You need a Mac or Linux computer with Node.js 22 or newer, and Claude Desktop or Claude Code, signed in. Then, in Claude (Claude Desktop's **Code** tab, in a session in any folder, or `claude` in a terminal), send these one at a time; **Mnemio → Settings → Claude** has them ready to copy:
+
+```
+/plugin marketplace add Mnemio-AI/mnemio-claude
+/plugin install mnemio@mnemio
+/mnemio:connect your-workspace.mnemio.ai
+```
+
+(If Claude doesn't know `/mnemio:connect` yet, send `/reload-plugins` first.) The last one opens your workspace in the browser: check the code and press **Approve**. Your Claude then checks this computer and asks whether it should **answer your chats here in the background**. Mnemio sends it a test message; once it answers, your Mnemio chats switch to your Claude and the Settings page turns green. If the listener couldn't start, or you said no, Settings says so, and your chats stay with your Mnemio assistant. The sign-in is this computer's own, saved privately in `~/.config/mnemio/`.
+
+Answering in the background needs Claude Code's `claude` command; on a Mac with only Claude Desktop, the listener uses the Claude Code inside Claude Desktop (and finds it again after Desktop updates).
+
+Prefer a terminal? Settings → Claude also gives you one command that does all of it (it needs the `claude` command):
 
 ```sh
 curl -fsSL https://your-workspace.mnemio.ai/api/claude/install/<one-time code> | sh
 ```
 
-You need Node.js 22 or newer and Claude Code, installed and signed in. That's all. It installs this plugin, signs this computer in (its own sign-in, saved privately in `~/.config/mnemio/`), and asks whether your Claude should **answer your chats on this computer in the background** (yes by default). Mnemio then sends your Claude a test message; once it answers, your Mnemio chats switch to your Claude and the Settings page turns green. If the listener couldn't start, Settings says why instead, and your chats stay with your Mnemio assistant. The code works once, for 10 minutes; fetching the link alone (a chat app's link preview, say) never uses it.
-
-Already in Claude Code? This does the same, approving in the browser instead:
-
-```
-/plugin install mnemio --marketplace Mnemio-AI/mnemio-claude
-/mnemio:connect your-workspace.mnemio.ai
-```
+The code works once, for 10 minutes; fetching the link alone (a chat app's link preview, say) never uses it.
 
 **Mnemio → Settings → Claude** lists every Claude you connected (sign any one out) and what the plugin does:
 

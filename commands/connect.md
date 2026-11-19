@@ -11,8 +11,13 @@ Connect this computer's Claude to the user's Mnemio workspace.
    - `{"connected": true, ...}`: tell them they're connected to that workspace. Mnemio's memory, company skills and tools work from now on (the tools appear in this session within a few seconds); settings are in Mnemio → Settings → Claude, and `/mnemio:status` shows them. Then go to step 3.
    - `{"waiting": true, ...}`: they haven't approved yet; remind them of the link, then run step 2 again.
    - An error (denied, expired): say so; they can run /mnemio:connect again.
-3. Ask the user, in one short question, whether their Claude should answer their Mnemio chats (web, Slack, Discord, WhatsApp, colleague requests) on this computer in the background, with no Claude Code window open. Say that Mnemio sends it a test message first and switches their chats to it only once it answers.
-   - Yes: run with the Bash tool `node "${CLAUDE_PLUGIN_ROOT}/scripts/listener.mjs" install` and tell them the result in one line. If it failed, say what it said; they can try again with /mnemio:listen on.
-   - No: tell them their chats stay with their Mnemio assistant, and /mnemio:listen on turns it on later.
+3. Run with the Bash tool: `node "${CLAUDE_PLUGIN_ROOT}/scripts/listener.mjs" check`. It prints whether the background listener can answer their chats here.
+   - `listener.running` or `listener.installed` is true: tell them their Claude already answers their chats on this computer in the background; it uses this sign-in from now on. Go to step 4.
+   - `supported` is false: say answering in the background works on macOS and Linux only; here, they can use cloud mode (Mnemio → Settings → Claude). Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/listener.mjs" skip` and go to step 4.
+   - `claude` is null: say answering in the background needs Claude Code itself (the `claude` command, or Claude Desktop on a Mac), which this computer doesn't have; once it's installed and signed in, /mnemio:listen on turns it on. Run the `skip` command above and go to step 4.
+   - Otherwise ask the user, in one short question, whether their Claude should answer their Mnemio chats (web, Slack, Discord, WhatsApp, colleague requests) on this computer in the background, with no Claude Code window open. Say that Mnemio sends it a test message first and switches their chats to it only once it answers. If `signedIn` is `"signed_out"`, add that Claude Code isn't signed in for background use here, so it answers only once Claude Code is signed in on this computer.
+     - Yes: run with the Bash tool `node "${CLAUDE_PLUGIN_ROOT}/scripts/listener.mjs" install` and tell them the result in one line. If it failed, say what it said; they can try again with /mnemio:listen on.
+     - No: run the `skip` command above, and tell them their chats stay with their Mnemio assistant; /mnemio:listen on turns it on later.
+4. Tell them Mnemio → Settings → Claude shows how it went, and turns green once their Claude has answered its test message.
 
-Never ask the user to paste a token into the chat.
+If running `node` fails because it isn't found, tell the user Mnemio needs Node.js 22 or newer (from nodejs.org), then to run /mnemio:connect again. Never ask the user to paste a token into the chat.

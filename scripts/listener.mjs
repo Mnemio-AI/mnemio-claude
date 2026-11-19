@@ -31,7 +31,7 @@ import { eventFor } from "./channel.mjs";
  * says whether Claude Code is signed in on this computer (`claude auth status`); while it isn't, the listener
  * collects nothing (messages wait, or go to cloud mode) and Mnemio shows "Sign in to Claude again".
  *
- *   node listener.mjs install | uninstall | status | run
+ *   node listener.mjs install | uninstall | status | check | skip | run
  */
 
 const LABEL = "ai.mnemio.listener";
@@ -437,11 +437,36 @@ export async function answerOne(m, { env = process.env, request = fetch, spawnFn
   }
 }
 
+/**
+ * The Claude Code that Claude Desktop keeps for its Code tab, for a Mac with Claude Desktop and no `claude` command:
+ * ~/Library/Application Support/Claude/claude-code/<version>/<build>/claude.app/Contents/MacOS/claude. It's the
+ * same Claude Code, but its place isn't documented and it moves with each Desktop update, so the listener looks it
+ * up again whenever the one it saved is gone. The newest version wins.
+ */
+export function desktopClaude({ home = homedir(), platform = process.platform } = {}) {
+  if (platform !== "darwin") return null;
+  const root = join(home, "Library/Application Support/Claude/claude-code");
+  const list = dir => { try { return readdirSync(dir); } catch { return []; } };
+  const newer = (a, b) => {
+    const [x, y] = [a, b].map(v => v.split(".").map(n => parseInt(n, 10) || 0));
+    for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (y[i] ?? 0) - (x[i] ?? 0);
+    return 0;
+  };
+  for (const version of list(root).filter(v => /^\d+(\.\d+)*$/.test(v)).sort(newer))
+    for (const build of list(join(root, version))) {
+      const bin = join(root, version, build, "claude.app/Contents/MacOS/claude");
+      if (existsSync(bin)) return bin;
+    }
+  return null;
+}
+
 /** How the service starts Claude: the paths found at install (a service doesn't get the login shell's PATH). */
-export function listenerSettings(env = process.env) {
+export function listenerSettings(env = process.env, { desktop = desktopClaude } = {}) {
   const saved = readJson(configPath(env), {});
+  // Claude Desktop's own moved with an update: find the new one.
+  const savedGone = saved.claude && saved.claude.startsWith("/") && !existsSync(saved.claude);
   return {
-    claude: env.MNEMIO_CLAUDE_BIN || saved.claude || "claude",
+    claude: env.MNEMIO_CLAUDE_BIN || (savedGone ? desktop() || saved.claude : saved.claude) || "claude",
     extraArgs: (env.MNEMIO_CLAUDE_EXTRA_ARGS || "").split(" ").filter(Boolean),
     env: { ...env, ...(saved.path && { PATH: saved.path }) }
   };
@@ -611,18 +636,19 @@ await run();
   return launcher;
 }
 
-function findClaude(env) {
+/** The `claude` command (Claude Code, installed on its own), else Claude Desktop's (desktopClaude). */
+function findClaude(env, { desktop = desktopClaude } = {}) {
   if (env.MNEMIO_CLAUDE_BIN) return env.MNEMIO_CLAUDE_BIN;
   try {
-    return execFileSync(env.SHELL || "/bin/sh", ["-lc", "command -v claude"], { encoding: "utf8" }).trim().split("\n").pop();
-  } catch {
-    return null;
-  }
+    const found = execFileSync(env.SHELL || "/bin/sh", ["-lc", "command -v claude"], { encoding: "utf8" }).trim().split("\n").pop();
+    if (found) return found;
+  } catch {}
+  return desktop();
 }
 
 export function install({ env = process.env, dryRun = env.MNEMIO_LISTENER_DRY_RUN === "1", exec = execFileSync } = {}) {
   const claude = findClaude(env);
-  if (!claude) throw new Error("Couldn't find the claude command. Install Claude Code, then run this again.");
+  if (!claude) throw new Error("Couldn't find Claude Code on this computer (the claude command, or Claude Desktop's). Install Claude Code, sign in, then run this again.");
   const node = process.execPath;
   const path = [...new Set([dirname(claude), dirname(node), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
   mkdirSync(listenerDir(env), { recursive: true, mode: 0o700 });
@@ -703,13 +729,36 @@ export function status({ env = process.env } = {}) {
   return { installed, running: recent(s?.heartbeatAt) || recent(s?.lastPollAt), busy: !!s?.busy, claude: s?.claude ?? "unknown", answered: s?.answered ?? 0, lastError: s?.lastError ?? null, log: join(listenerDir(env), "listener.log") };
 }
 
+/**
+ * What /mnemio:connect looks at before offering the listener: whether it can run here (macOS or Linux, Node 22+),
+ * which Claude Code it would use, whether that one is signed in, and whether a listener is on already.
+ */
+export async function check({ env = process.env, platform = process.platform, node = process.versions.node, desktop = desktopClaude, signIn = claudeSignIn } = {}) {
+  const claude = findClaude(env, { desktop });
+  const s = status({ env });
+  return {
+    supported: ["darwin", "linux"].includes(platform),
+    node,
+    nodeOk: Number(node.split(".")[0]) >= 22,
+    claude,
+    claudeFrom: !claude ? null : claude === desktop() ? "claude-desktop" : "claude-code",
+    signedIn: claude ? await signIn({ claude, env: { ...env, PATH: [dirname(claude), env.PATH].filter(Boolean).join(":") } }) : "unknown",
+    listener: { installed: s.installed, running: s.running }
+  };
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const action = process.argv[2] || "run";
   try {
     if (action === "run") await run();
-    else {
+    else if (action === "check") console.log(JSON.stringify(await check()));
+    else if (action === "skip") {
+      // They said no to the listener: Settings says so instead of waiting for one.
+      await reportSetup("skipped");
+      console.log(JSON.stringify({ installed: false, skipped: true }));
+    } else {
       const r = action === "install" ? install() : action === "uninstall" ? uninstall() : action === "status" ? status() : null;
-      if (!r) throw new Error("Use install, uninstall, status or run.");
+      if (!r) throw new Error("Use install, uninstall, status, check, skip or run.");
       if (action === "install") {
         await reportSetup("installed");
         const signedIn = await claudeSignIn();

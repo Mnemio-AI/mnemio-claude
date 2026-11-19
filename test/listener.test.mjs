@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { answerOne, claudeArgs, claudeSignIn, install, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, reportSetup, runClaude, shortName, startHeartbeat, status, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
+import { answerOne, check, claudeArgs, claudeSignIn, desktopClaude, install, listenerSettings, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, reportSetup, runClaude, shortName, startHeartbeat, status, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
 import { readCredentials } from "../scripts/lib/credentials.mjs";
@@ -582,4 +582,55 @@ test("setting the listener up is reported to Mnemio, and a failure says what wen
   await reportSetup("failed", "Couldn't find the claude command.", { env, request });
   assert.deepEqual(sent, [{ path: "/api/claude/listener/setup", body: { install: "installed" } }, { path: "/api/claude/listener/setup", body: { install: "failed", error: "Couldn't find the claude command." } }]);
   await reportSetup("off", undefined, { env, request: async () => { throw new Error("offline"); } });
+});
+
+/** A fake Claude Desktop folder with these versions of its Claude Code (each in a build folder). */
+async function desktopHome(t, versions) {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "mnemio-desktop-")));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const v of versions) {
+    const bin = join(dir, "Library/Application Support/Claude/claude-code", v, "b0", "claude.app/Contents/MacOS");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, "claude"), "#!/bin/sh\n");
+    await chmod(join(bin, "claude"), 0o755);
+  }
+  return dir;
+}
+
+test("on a Mac with only Claude Desktop, the listener uses Desktop's Claude Code, the newest one", async t => {
+  const home = await desktopHome(t, ["2.1.9", "2.1.325", "2.1.40"]);
+  const bin = desktopClaude({ home, platform: "darwin" });
+  assert.match(bin, /claude-code\/2\.1\.325\/b0\/claude\.app\/Contents\/MacOS\/claude$/);
+  assert.equal(desktopClaude({ home, platform: "linux" }), null);
+  assert.equal(desktopClaude({ home: join(home, "nowhere"), platform: "darwin" }), null);
+});
+
+test("when Claude Desktop updates and the saved Claude Code is gone, the listener finds the new one", async t => {
+  const env = await home(t);
+  delete env.MNEMIO_CLAUDE_BIN;
+  await mkdir(listenerDir(env), { recursive: true });
+  const gone = "/Applications/Nowhere/claude.app/Contents/MacOS/claude";
+  await writeFile(join(listenerDir(env), "listener.json"), JSON.stringify({ claude: gone, path: "/usr/bin" }));
+  assert.equal(listenerSettings(env, { desktop: () => "/new/claude" }).claude, "/new/claude");
+  // Still there (or a bare command name): kept as it is.
+  await writeFile(join(listenerDir(env), "listener.json"), JSON.stringify({ claude: process.execPath }));
+  assert.equal(listenerSettings(env, { desktop: () => "/new/claude" }).claude, process.execPath);
+  await writeFile(join(listenerDir(env), "listener.json"), JSON.stringify({ claude: "claude" }));
+  assert.equal(listenerSettings(env, { desktop: () => "/new/claude" }).claude, "claude");
+});
+
+test("check says what /mnemio:connect needs to know before offering the listener", async t => {
+  const env = await home(t);
+  const seen = [];
+  const signIn = async s => { seen.push(s.claude); return "signed_out"; };
+  const r = await check({ env, platform: "darwin", node: "22.3.0", desktop: () => null, signIn });
+  assert.deepEqual({ ...r, listener: undefined }, { supported: true, node: "22.3.0", nodeOk: true, claude: "/usr/local/bin/claude", claudeFrom: "claude-code", signedIn: "signed_out", listener: undefined });
+  assert.deepEqual(seen, ["/usr/local/bin/claude"]);
+  assert.equal(typeof r.listener.installed, "boolean");
+  const old = await check({ env, platform: "win32", node: "20.11.1", desktop: () => null, signIn });
+  assert.equal(old.supported, false);
+  assert.equal(old.nodeOk, false);
+  // Claude Desktop's own Claude Code is said to be that.
+  const desk = await check({ env: { ...env, MNEMIO_CLAUDE_BIN: "/d/claude" }, platform: "darwin", desktop: () => "/d/claude", signIn: async () => "ok" });
+  assert.equal(desk.claudeFrom, "claude-desktop");
 });
