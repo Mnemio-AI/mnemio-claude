@@ -44,9 +44,14 @@ async function post(base, path, body, request) {
   return { status: r.status, data };
 }
 
+/** Why this Node.js is too old for the plugin (its hooks and the listener need 22+), or null. */
+export const nodeTooOld = (node = process.versions.node) =>
+  Number(node.split(".")[0]) < 22 ? `Mnemio needs Node.js 22 or newer, and this computer has ${node}. Install it from nodejs.org, then run /mnemio:connect again.` : null;
+
 export async function connect(input, { env = process.env, request = fetch, sleep = ms => new Promise(r => setTimeout(r, ms)), waitMs = 270000, log = m => process.stderr.write(m + "\n"), node = process.versions.node } = {}) {
-  // Before any code is shown: the plugin's hooks and the listener need it.
-  if (Number(node.split(".")[0]) < 22) throw new Error(`Mnemio needs Node.js 22 or newer, and this computer has ${node}. Install it from nodejs.org, then run /mnemio:connect again.`);
+  // Before any code is shown.
+  const old = nodeTooOld(node);
+  if (old) throw new Error(old);
   const url = workspaceUrl(input) || workspaceUrl(env.MNEMIO_URL) || readCredentials(env)?.url || readPending(env)?.url;
   if (!url) throw new Error("Which Mnemio workspace? Run /mnemio:connect with its address, for example /mnemio:connect acme.mnemio.ai.");
 

@@ -144,3 +144,16 @@ test("connect stops before showing a code when Node.js is too old for the plugin
   await assert.rejects(connect("acme.mnemio.ai", { env: {}, request: async () => { called = true; }, node: "20.11.1", waitMs: 0, log: () => {} }), /Node\.js 22 or newer, and this computer has 20\.11\.1/);
   assert.equal(called, false);
 });
+
+test("on a Node.js too old to have fetch, the command says to upgrade instead of failing on fetch", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const old = 'Object.defineProperty(process, "versions", { value: { ...process.versions, node: "16.20.0" } }); delete globalThis.fetch;';
+  let out = "";
+  try {
+    execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(old)}`, new URL("../scripts/brain.mjs", import.meta.url).pathname, "connect", "acme.mnemio.ai"], { encoding: "utf8", stdio: "pipe", env: { ...process.env, MNEMIO_CONFIG_DIR: tmpdir() } });
+  } catch (e) {
+    out = e.stderr;
+  }
+  assert.match(out, /Node\.js 22 or newer, and this computer has 16\.20\.0/);
+  assert.doesNotMatch(out, /fetch is not defined/);
+});

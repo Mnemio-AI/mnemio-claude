@@ -42,6 +42,12 @@ const HEARTBEAT_MS = 30_000;
 /** How often it checks Claude Code is still signed in: now and then while it is, every minute while it isn't. */
 const SIGN_IN_CHECK_MS = 10 * 60_000;
 const SIGNED_OUT_CHECK_MS = 60_000;
+/**
+ * `claude auth status` can say signed out while Claude answers fine (seen with Claude Code 2.1.325: the same check
+ * flips with the environment, and after a `claude -p` has run). So it never stops the listener on its own: only an
+ * answer that failed for want of a sign-in does, and while stopped, Claude itself is tried this often.
+ */
+const PROBE_MS = 10 * 60_000;
 /** What Claude Code says when its sign-in is gone. */
 const SIGNED_OUT = /not logged in|please run \/login|log in again|invalid api key|oauth token (has )?expired|authentication_error|unauthori[sz]ed/i;
 const signedOutText = () => `Claude Code is signed out on ${hostname().replace(/\.local$/, "")}. Open Claude Code there and sign in again (/login).`;
@@ -460,11 +466,15 @@ export function desktopClaude({ home = homedir(), platform = process.platform } 
   return null;
 }
 
+/** Whether `bin` is a Claude Code inside Claude Desktop (desktopClaude). */
+export const isDesktopClaude = bin => typeof bin === "string" && bin.includes("/Library/Application Support/Claude/claude-code/") && bin.endsWith("/claude.app/Contents/MacOS/claude");
+
 /** How the service starts Claude: the paths found at install (a service doesn't get the login shell's PATH). */
 export function listenerSettings(env = process.env, { desktop = desktopClaude } = {}) {
   const saved = readJson(configPath(env), {});
-  // Claude Desktop's own moved with an update: find the new one.
-  const savedGone = saved.claude && saved.claude.startsWith("/") && !existsSync(saved.claude);
+  // Claude Desktop's own moved with an update: find the new one. (Only Desktop's: a command chosen on purpose that
+  // went away isn't swapped for another Claude behind the person's back.)
+  const savedGone = isDesktopClaude(saved.claude) && !existsSync(saved.claude);
   return {
     claude: env.MNEMIO_CLAUDE_BIN || (savedGone ? desktop() || saved.claude : saved.claude) || "claude",
     extraArgs: (env.MNEMIO_CLAUDE_EXTRA_ARGS || "").split(" ").filter(Boolean),
@@ -494,6 +504,17 @@ export function claudeSignIn(settings = listenerSettings(), { execFn = execFile 
   });
 }
 
+/** Whether Claude itself answers: a one-line prompt, as a message would run. Used only while stopped as signed out. */
+export function claudeProbe(settings = listenerSettings(), { cwd = workDir(), execFn = execFile } = {}) {
+  return new Promise(resolve => {
+    mkdirSync(cwd, { recursive: true, mode: 0o700 });
+    execFn(settings.claude, ["-p", "Reply with just OK.", "--max-turns", "1"], { cwd, env: { ...settings.env, MNEMIO_CHANNEL: "", MNEMIO_LISTENER: "1" }, timeout: 120_000 }, (err, stdout, stderr) => {
+      if (!err) return resolve("ok");
+      resolve(SIGNED_OUT.test(`${stdout ?? ""}\n${stderr ?? ""}`) ? "signed_out" : "unknown");
+    });
+  });
+}
+
 /** Tells Mnemio how this listener is: once now, then every `every` ms. Returns a function that stops it. */
 export function startHeartbeat(state, { env = process.env, request = fetch, every = HEARTBEAT_MS, version = pluginVersion() } = {}) {
   const beat = async () => {
@@ -510,20 +531,49 @@ export function startHeartbeat(state, { env = process.env, request = fetch, ever
   return () => clearInterval(timer);
 }
 
-/** Tells Mnemio how setting the listener up went (shown in Settings → Claude). Never throws. */
+/** Tells Mnemio how setting the listener up went (shown in Settings → Claude). Never throws: true if Mnemio got it. */
 export async function reportSetup(install, error, { env = process.env, request = fetch } = {}) {
-  if (!isConnected(env)) return;
-  await callMnemio("listener/setup", { install, ...(error && { error: String(error).slice(-1500) }) }, { env, request, timeout: 15_000 }).catch(() => {});
+  if (!isConnected(env)) return false;
+  const send = () => callMnemio("listener/setup", { install, ...(error && { error: String(error).slice(-1500) }) }, { env, request, timeout: 15_000 });
+  // Once more after a moment: a blip shouldn't leave Settings waiting for an answer that was given.
+  for (let tries = 0; tries < 2; tries++) {
+    try {
+      await send();
+      return true;
+    } catch {
+      if (tries === 0) await new Promise(r => setTimeout(r, 1_000));
+    }
+  }
+  return false;
 }
 
 /** The loop the service runs: collect, answer, repeat. `once`: one round, no heartbeat (tests). */
-export async function run({ env = process.env, request = fetch, spawnFn = spawn, sleep = ms => new Promise(r => setTimeout(r, ms)), once = false, managedPaths = managedMcpPaths(), signIn = () => claudeSignIn(listenerSettings(env)) } = {}) {
-  const state = { pid: process.pid, startedAt: new Date().toISOString(), answered: 0, lastPollAt: null, heartbeatAt: null, lastError: null, claude: "unknown", busy: false };
+export async function run({ env = process.env, request = fetch, spawnFn = spawn, sleep = ms => new Promise(r => setTimeout(r, ms)), once = false, managedPaths = managedMcpPaths(), signIn = () => claudeSignIn(listenerSettings(env)), probe = () => claudeProbe(listenerSettings(env), { cwd: workDir(env) }) } = {}) {
+  const state = { pid: process.pid, startedAt: new Date().toISOString(), answered: 0, lastPollAt: null, heartbeatAt: null, lastError: null, claude: "unknown", signedOutAt: null, busy: false };
   const save = () => writeJson(statePath(env), state);
   let checkedAt = 0;
+  let probedAt = 0;
+  // Restarted (the service is kept alive, or the computer woke up) after stopping as signed out: still stopped, rather
+  // than spending a message to find out again; Claude itself is tried on the usual schedule.
+  const before = readJson(statePath(env), null);
+  if (before?.claude === "signed_out" && Date.now() - Date.parse(before.signedOutAt ?? "") < 24 * 3600_000) {
+    Object.assign(state, { claude: "signed_out", signedOutAt: before.signedOutAt });
+    probedAt = Date.parse(before.signedOutAt);
+  }
+  const signedOut = () => {
+    Object.assign(state, { claude: "signed_out", signedOutAt: new Date().toISOString() });
+    probedAt = Date.now();
+  };
+  const signedInAgain = () => Object.assign(state, { claude: "ok", signedOutAt: null });
+  /** `auth status` can clear "signed out", never set it (PROBE_MS); while stopped, Claude itself is tried now and then. */
   const checkSignIn = async () => {
-    state.claude = await signIn().catch(() => "unknown");
     checkedAt = Date.now();
+    const said = await signIn().catch(() => "unknown");
+    if (said === "ok") return signedInAgain();
+    if (state.claude !== "signed_out") return void (state.claude = "unknown");
+    if (Date.now() - probedAt < PROBE_MS) return;
+    probedAt = Date.now();
+    if ((await probe().catch(() => "unknown")) === "ok") signedInAgain();
   };
   save();
   const stop = once ? () => {} : startHeartbeat(state, { env, request });
@@ -565,15 +615,16 @@ export async function run({ env = process.env, request = fetch, spawnFn = spawn,
             await answerOne(m, { env, request, spawnFn });
             state.answered++;
             state.lastError = null;
-            state.claude = "ok";
+            signedInAgain();
           } catch (e) {
             state.lastError = e.detail ? `${e.message} ${e.detail}` : e.message;
             // Claude Code's sign-in is gone: checked at once, so the listener stops collecting and Mnemio shows it.
             let why = e.message;
             if (SIGNED_OUT.test(state.lastError)) {
-              await checkSignIn();
-              if (state.claude !== "ok") {
-                state.claude = "signed_out";
+              checkedAt = Date.now();
+              // The answer itself failed for want of a sign-in: unless `auth status` says otherwise, stop collecting.
+              if ((await signIn().catch(() => "unknown")) !== "ok") {
+                signedOut();
                 why = signedOutText();
                 state.lastError = why;
               }
@@ -646,16 +697,25 @@ function findClaude(env, { desktop = desktopClaude } = {}) {
   return desktop();
 }
 
+/**
+ * The environment the service runs with: only these, nothing else from the shell it was set up in (an
+ * ANTHROPIC_API_KEY exported in a shell profile, say, isn't there).
+ */
+export function serviceEnv(claude, env = process.env, node = process.execPath) {
+  const path = [...new Set([dirname(claude), dirname(node), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
+  return { HOME: homedir(), PATH: path, ...(env.MNEMIO_CONFIG_DIR && { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }), ...(env.CLAUDE_CONFIG_DIR && { CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR }) };
+}
+
 export function install({ env = process.env, dryRun = env.MNEMIO_LISTENER_DRY_RUN === "1", exec = execFileSync } = {}) {
   const claude = findClaude(env);
   if (!claude) throw new Error("Couldn't find Claude Code on this computer (the claude command, or Claude Desktop's). Install Claude Code, sign in, then run this again.");
   const node = process.execPath;
-  const path = [...new Set([dirname(claude), dirname(node), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
+  const extraEnv = serviceEnv(claude, env, node);
+  const path = extraEnv.PATH;
   mkdirSync(listenerDir(env), { recursive: true, mode: 0o700 });
   writeJson(configPath(env), { claude, node, path, installedAt: new Date().toISOString() });
   const launcher = writeLauncher(env);
   const log = join(listenerDir(env), "listener.log");
-  const extraEnv = { HOME: homedir(), PATH: path, ...(env.MNEMIO_CONFIG_DIR && { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }), ...(env.CLAUDE_CONFIG_DIR && { CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR }) };
 
   if (process.platform === "darwin") {
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -742,7 +802,8 @@ export async function check({ env = process.env, platform = process.platform, no
     nodeOk: Number(node.split(".")[0]) >= 22,
     claude,
     claudeFrom: !claude ? null : claude === desktop() ? "claude-desktop" : "claude-code",
-    signedIn: claude ? await signIn({ claude, env: { ...env, PATH: [dirname(claude), env.PATH].filter(Boolean).join(":") } }) : "unknown",
+    // As the service will see it, not as this shell does.
+    signedIn: claude ? await signIn({ claude, env: serviceEnv(claude, env) }) : "unknown",
     listener: { installed: s.installed, running: s.running }
   };
 }
@@ -754,8 +815,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     else if (action === "check") console.log(JSON.stringify(await check()));
     else if (action === "skip") {
       // They said no to the listener: Settings says so instead of waiting for one.
-      await reportSetup("skipped");
-      console.log(JSON.stringify({ installed: false, skipped: true }));
+      console.log(JSON.stringify({ installed: false, skipped: true, told: await reportSetup("skipped") }));
     } else {
       const r = action === "install" ? install() : action === "uninstall" ? uninstall() : action === "status" ? status() : null;
       if (!r) throw new Error("Use install, uninstall, status, check, skip or run.");
@@ -763,7 +823,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         await reportSetup("installed");
         const signedIn = await claudeSignIn();
         console.log(`  Your Claude now answers your chats on this computer, in the background (log: ${r.log}).`);
-        if (signedIn === "signed_out") console.log(`  But ${signedOutText()} Until then it answers nothing.`);
+        if (signedIn === "signed_out") console.log(`  Claude Code may be signed out on this computer; if so, Mnemio → Settings → Claude says so after its test message.`);
       } else if (action === "uninstall") {
         await reportSetup("off");
         console.log(JSON.stringify(r));
