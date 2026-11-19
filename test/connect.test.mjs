@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { connect, disconnect, workspaceUrl } from "../scripts/lib/connect.mjs";
 import { readCredentials, saveCredentials } from "../scripts/lib/credentials.mjs";
 import { mnemioConfig } from "../scripts/lib/http.mjs";
@@ -137,4 +138,23 @@ test("the plugin's server passes on Mnemio's tools and connected apps, and says 
   const appCalls = upstream.filter(u => u.path === "/api/claude/apps/mcp");
   assert.equal(appCalls.at(-1).session, "s-1", "keeps the apps server's session");
   assert.ok(upstream.every(u => u.auth === "Bearer mnemio_cc_t"), "the saved sign-in is used");
+});
+
+test("connect stops before showing a code when Node.js is too old for the plugin", async t => {
+  let called = false;
+  await assert.rejects(connect("acme.mnemio.ai", { env: {}, request: async () => { called = true; }, node: "20.11.1", waitMs: 0, log: () => {} }), /Node\.js 22 or newer, and this computer has 20\.11\.1/);
+  assert.equal(called, false);
+});
+
+test("on a Node.js too old to have fetch, the command says to upgrade instead of failing on fetch", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const old = 'Object.defineProperty(process, "versions", { value: { ...process.versions, node: "16.20.0" } }); delete globalThis.fetch;';
+  let out = "";
+  try {
+    execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(old)}`, fileURLToPath(new URL("../scripts/brain.mjs", import.meta.url)), "connect", "acme.mnemio.ai"], { encoding: "utf8", stdio: "pipe", env: { ...process.env, MNEMIO_CONFIG_DIR: tmpdir() } });
+  } catch (e) {
+    out = e.stderr;
+  }
+  assert.match(out, /Node\.js 22 or newer, and this computer has 16\.20\.0/);
+  assert.doesNotMatch(out, /fetch is not defined/);
 });

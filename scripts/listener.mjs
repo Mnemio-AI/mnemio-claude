@@ -1,12 +1,12 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 import { callMnemio, isConnected } from "./lib/http.mjs";
-import { configDir } from "./lib/credentials.mjs";
+import { configDir, forgetListenerOffer } from "./lib/credentials.mjs";
 import { downloadAttachments, LIMITS, replyFiles } from "./lib/attachments.mjs";
 import { describeStep } from "./lib/steps.mjs";
 import { eventFor } from "./channel.mjs";
@@ -26,12 +26,31 @@ import { eventFor } from "./channel.mjs";
  * While Claude works, each tool it uses is reported to Mnemio as a step (POST /api/claude/inbox/:id/progress), so
  * the person sees "Searching memory", "Using mnemio-release-checklist", … in their chat, as with Mnemio's own assistant.
  *
- *   node listener.mjs install | uninstall | status | run
+ * Apart from collecting messages, it sends Mnemio a heartbeat every 30 seconds (POST /api/claude/listener/heartbeat):
+ * answering one message can take minutes, and Mnemio must not take a busy listener for one that's gone. The heartbeat
+ * says whether Claude Code is signed in on this computer (`claude auth status`); while it isn't, the listener
+ * collects nothing (messages wait, or go to cloud mode) and Mnemio shows "Sign in to Claude again".
+ *
+ *   node listener.mjs install | uninstall | status | check | skip | run
  */
 
 const LABEL = "ai.mnemio.listener";
 const SERVICE = "mnemio-listener";
 const CLAUDE_TIMEOUT_MS = 10 * 60_000;
+/** The heartbeat, apart from collecting messages (Mnemio takes the listener for gone after missing about three). */
+const HEARTBEAT_MS = 30_000;
+/** How often it checks Claude Code is still signed in: now and then while it is, every minute while it isn't. */
+const SIGN_IN_CHECK_MS = 10 * 60_000;
+const SIGNED_OUT_CHECK_MS = 60_000;
+/**
+ * `claude auth status` can say signed out while Claude answers fine (seen with Claude Code 2.1.325: the same check
+ * flips with the environment, and after a `claude -p` has run). So it never stops the listener on its own: only an
+ * answer that failed for want of a sign-in does, and while stopped, Claude itself is tried this often.
+ */
+const PROBE_MS = 10 * 60_000;
+/** What Claude Code says when its sign-in is gone. */
+const SIGNED_OUT = /not logged in|please run \/login|log in again|invalid api key|oauth token (has )?expired|authentication_error|unauthori[sz]ed/i;
+const signedOutText = () => `Claude Code is signed out on ${hostname().replace(/\.local$/, "")}. Open Claude Code there and sign in again (/login).`;
 /** What Claude is told after the message; `outbox` is the folder (a full path) it may write to. */
 const instructions = outbox => [
   "",
@@ -424,63 +443,225 @@ export async function answerOne(m, { env = process.env, request = fetch, spawnFn
   }
 }
 
+/**
+ * The Claude Code that Claude Desktop keeps for its Code tab, for a Mac with Claude Desktop and no `claude` command:
+ * ~/Library/Application Support/Claude/claude-code/<version>/<build>/claude.app/Contents/MacOS/claude. It's the
+ * same Claude Code, but its place isn't documented and it moves with each Desktop update, so the listener looks it
+ * up again whenever the one it saved is gone. The newest version wins.
+ */
+export function desktopClaude({ home = homedir(), platform = process.platform } = {}) {
+  if (platform !== "darwin") return null;
+  const root = join(home, "Library/Application Support/Claude/claude-code");
+  const list = dir => { try { return readdirSync(dir); } catch { return []; } };
+  const newer = (a, b) => {
+    const [x, y] = [a, b].map(v => v.split(".").map(n => parseInt(n, 10) || 0));
+    for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (y[i] ?? 0) - (x[i] ?? 0);
+    return 0;
+  };
+  for (const version of list(root).filter(v => /^\d+(\.\d+)*$/.test(v)).sort(newer))
+    for (const build of list(join(root, version))) {
+      const bin = join(root, version, build, "claude.app/Contents/MacOS/claude");
+      if (existsSync(bin)) return bin;
+    }
+  return null;
+}
+
+/** Whether `bin` is a Claude Code inside Claude Desktop (desktopClaude). */
+export const isDesktopClaude = bin => typeof bin === "string" && bin.includes("/Library/Application Support/Claude/claude-code/") && bin.endsWith("/claude.app/Contents/MacOS/claude");
+
 /** How the service starts Claude: the paths found at install (a service doesn't get the login shell's PATH). */
-export function listenerSettings(env = process.env) {
+export function listenerSettings(env = process.env, { desktop = desktopClaude } = {}) {
   const saved = readJson(configPath(env), {});
+  // Claude Desktop's own moved with an update: find the new one. (Only Desktop's: a command chosen on purpose that
+  // went away isn't swapped for another Claude behind the person's back.)
+  const savedGone = isDesktopClaude(saved.claude) && !existsSync(saved.claude);
   return {
-    claude: env.MNEMIO_CLAUDE_BIN || saved.claude || "claude",
+    claude: env.MNEMIO_CLAUDE_BIN || (savedGone ? desktop() || saved.claude : saved.claude) || "claude",
     extraArgs: (env.MNEMIO_CLAUDE_EXTRA_ARGS || "").split(" ").filter(Boolean),
     env: { ...env, ...(saved.path && { PATH: saved.path }) }
   };
 }
 
-/** The loop the service runs: collect, answer, repeat. */
-export async function run({ env = process.env, request = fetch, spawnFn = spawn, sleep = ms => new Promise(r => setTimeout(r, ms)), once = false, managedPaths = managedMcpPaths() } = {}) {
-  const state = { pid: process.pid, startedAt: new Date().toISOString(), answered: 0, lastPollAt: null, lastError: null };
-  const save = () => writeJson(statePath(env), state);
-  save();
-  let backoff = 2000;
-  for (;;) {
-    // Checked before taking any message: one taken here couldn't be answered.
-    const managed = managedPaths.find(p => existsSync(p));
-    if (managed) {
-      state.lastError = `Your company manages Claude Code's MCP servers on this computer (${managed}), so the listener can't keep your Claude to Mnemio's tools here. Use cloud mode in Mnemio → Settings → Claude, or ask your admin.`;
-      save();
-      if (once) return state;
-      await sleep(10 * 60_000);
-      continue;
-    }
-    if (!isConnected(env)) {
-      state.lastError = "Not connected to Mnemio: run /mnemio:connect in Claude Code.";
-      save();
-      if (once) return state;
-      await sleep(30000);
-      continue;
-    }
+/** The plugin's version, for the heartbeat. */
+export function pluginVersion() {
+  return readJson(new URL("../.claude-plugin/plugin.json", import.meta.url), {}).version ?? null;
+}
+
+/**
+ * Whether Claude Code is signed in here: "ok", "signed_out", or "unknown" (a Claude Code without `auth status`, or
+ * one that didn't answer in time). Never blocks the loop for long.
+ */
+export function claudeSignIn(settings = listenerSettings(), { execFn = execFile } = {}) {
+  return new Promise(resolve => {
+    execFn(settings.claude, ["auth", "status", "--json"], { env: settings.env, timeout: 15_000 }, (err, stdout) => {
+      // Signed out, it may still print its status, with a failing exit code.
+      try {
+        const j = JSON.parse(String(stdout || ""));
+        if (typeof j.loggedIn === "boolean") return resolve(j.loggedIn ? "ok" : "signed_out");
+      } catch {}
+      resolve("unknown");
+    });
+  });
+}
+
+/**
+ * Whether Claude itself answers: a one-line prompt with the same sign-in options as a reply (`extraArgs`), but nothing
+ * else: no tools, no MCP servers, no browser, in the listener's own folder. Used only while stopped as signed out.
+ */
+export const probeArgs = (extra = []) => ["-p", "Reply with just OK.", "--max-turns", "1", "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", ...extra];
+
+export function claudeProbe(settings = listenerSettings(), { cwd = workDir(), execFn = execFile } = {}) {
+  return new Promise((resolve, reject) => {
     try {
-      const m = await callMnemio("inbox/next?wait=25", undefined, { env, request, timeout: 40000 });
-      state.lastPollAt = new Date().toISOString();
-      backoff = 2000;
-      if (m) {
-        try {
-          await answerOne(m, { env, request, spawnFn });
-          state.answered++;
-          state.lastError = null;
-        } catch (e) {
-          state.lastError = e.detail ? `${e.message} ${e.detail}` : e.message;
-          // Tell them rather than leave them waiting; the message isn't retried. `failed`: Mnemio doesn't take it for
-          // an answer (a briefing isn't sent as one, nothing is saved to memory).
-          await callMnemio(`inbox/${encodeURIComponent(m.id)}/reply`, { text: `_Your Claude couldn't answer this: ${e.message}_`, failed: true, ...(e.steps?.length && { steps: e.steps }) }, { env, request }).catch(() => {});
-        }
-      }
-      save();
+      realDir(cwd);
     } catch (e) {
-      state.lastError = e.message;
-      save();
-      await sleep(backoff);
-      backoff = Math.min(backoff * 2, 60000);
+      return reject(e);
     }
-    if (once) return state;
+    execFn(settings.claude, probeArgs(settings.extraArgs), { cwd, env: { ...settings.env, MNEMIO_CHANNEL: "", MNEMIO_LISTENER: "1" }, timeout: 120_000 }, (err, stdout, stderr) => {
+      if (!err) return resolve("ok");
+      resolve(SIGNED_OUT.test(`${stdout ?? ""}\n${stderr ?? ""}`) ? "signed_out" : "unknown");
+    });
+  });
+}
+
+/** Tells Mnemio how this listener is: once now, then every `every` ms. Returns a function that stops it. */
+export function startHeartbeat(state, { env = process.env, request = fetch, every = HEARTBEAT_MS, version = pluginVersion() } = {}) {
+  const beat = async () => {
+    if (!isConnected(env)) return;
+    try {
+      await callMnemio("listener/heartbeat", { ...(version && { version }), claude: state.claude ?? "unknown", busy: !!state.busy, error: state.lastError ? String(state.lastError).slice(0, 500) : null }, { env, request, timeout: 15_000 });
+      state.heartbeatAt = new Date().toISOString();
+      writeJson(statePath(env), state);
+    } catch {}
+  };
+  void beat();
+  const timer = setInterval(beat, every);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+/** Tells Mnemio how setting the listener up went (shown in Settings → Claude). Never throws: true if Mnemio got it. */
+export async function reportSetup(install, error, { env = process.env, request = fetch } = {}) {
+  if (!isConnected(env)) return false;
+  const send = () => callMnemio("listener/setup", { install, ...(error && { error: String(error).slice(-1500) }) }, { env, request, timeout: 15_000 });
+  // Once more after a moment: a blip shouldn't leave Settings waiting for an answer that was given.
+  for (let tries = 0; tries < 2; tries++) {
+    try {
+      await send();
+      return true;
+    } catch {
+      if (tries === 0) await new Promise(r => setTimeout(r, 1_000));
+    }
+  }
+  return false;
+}
+
+/** The loop the service runs: collect, answer, repeat. `once`: one round, no heartbeat (tests). */
+export async function run({ env = process.env, request = fetch, spawnFn = spawn, sleep = ms => new Promise(r => setTimeout(r, ms)), once = false, managedPaths = managedMcpPaths(), signIn = () => claudeSignIn(listenerSettings(env)), probe = () => claudeProbe(listenerSettings(env), { cwd: workDir(env) }) } = {}) {
+  const state = { pid: process.pid, startedAt: new Date().toISOString(), answered: 0, lastPollAt: null, heartbeatAt: null, lastError: null, claude: "unknown", signedOutAt: null, probedAt: null, busy: false };
+  const save = () => writeJson(statePath(env), state);
+  let checkedAt = 0;
+  let probedAt = 0;
+  // Restarted (the service is kept alive, or the computer woke up) after stopping as signed out: still stopped, rather
+  // than spending a message to find out again; Claude itself is tried on the usual schedule.
+  const before = readJson(statePath(env), null);
+  if (before?.claude === "signed_out" && Date.now() - Date.parse(before.signedOutAt ?? "") < 24 * 3600_000) {
+    Object.assign(state, { claude: "signed_out", signedOutAt: before.signedOutAt, probedAt: before.probedAt ?? before.signedOutAt });
+    probedAt = Date.parse(state.probedAt) || Date.now();
+  }
+  const signedOut = () => {
+    probedAt = Date.now();
+    Object.assign(state, { claude: "signed_out", signedOutAt: new Date(probedAt).toISOString(), probedAt: new Date(probedAt).toISOString() });
+  };
+  const signedInAgain = () => {
+    if (state.claude === "signed_out" && state.lastError === signedOutText()) state.lastError = null;
+    Object.assign(state, { claude: "ok", signedOutAt: null, probedAt: null });
+  };
+  /** `auth status` can clear "signed out", never set it (PROBE_MS); while stopped, Claude itself is tried now and then. */
+  const checkSignIn = async () => {
+    checkedAt = Date.now();
+    const said = await signIn().catch(() => "unknown");
+    if (said === "ok") return signedInAgain();
+    if (state.claude !== "signed_out") return void (state.claude = "unknown");
+    if (Date.now() - probedAt < PROBE_MS) return;
+    // Saved before it starts, so a restart right after doesn't try again at once.
+    probedAt = Date.now();
+    state.probedAt = new Date(probedAt).toISOString();
+    save();
+    if ((await probe().catch(() => "unknown")) === "ok") signedInAgain();
+  };
+  save();
+  const stop = once ? () => {} : startHeartbeat(state, { env, request });
+  let backoff = 2000;
+  try {
+    for (;;) {
+      // Checked before taking any message: one taken here couldn't be answered.
+      const managed = managedPaths.find(p => existsSync(p));
+      if (managed) {
+        state.lastError = `Your company manages Claude Code's MCP servers on this computer (${managed}), so the listener can't keep your Claude to Mnemio's tools here. Use cloud mode in Mnemio → Settings → Claude, or ask your admin.`;
+        save();
+        if (once) return state;
+        await sleep(10 * 60_000);
+        continue;
+      }
+      if (!isConnected(env)) {
+        state.lastError = "Not connected to Mnemio: run /mnemio:connect in Claude Code.";
+        save();
+        if (once) return state;
+        await sleep(30000);
+        continue;
+      }
+      if (Date.now() - checkedAt > (state.claude === "signed_out" ? SIGNED_OUT_CHECK_MS : SIGN_IN_CHECK_MS)) await checkSignIn();
+      // Signed out, every answer would fail: collect nothing until they sign in again (the heartbeat tells Mnemio why).
+      if (state.claude === "signed_out") {
+        state.lastError = signedOutText();
+        save();
+        if (once) return state;
+        await sleep(SIGNED_OUT_CHECK_MS);
+        continue;
+      }
+      try {
+        const m = await callMnemio("inbox/next?wait=25", undefined, { env, request, timeout: 40000 });
+        state.lastPollAt = new Date().toISOString();
+        backoff = 2000;
+        if (m) {
+          state.busy = true;
+          try {
+            await answerOne(m, { env, request, spawnFn });
+            state.answered++;
+            state.lastError = null;
+            signedInAgain();
+          } catch (e) {
+            state.lastError = e.detail ? `${e.message} ${e.detail}` : e.message;
+            // Claude Code's sign-in is gone: checked at once, so the listener stops collecting and Mnemio shows it.
+            let why = e.message;
+            if (SIGNED_OUT.test(state.lastError)) {
+              checkedAt = Date.now();
+              // The answer itself failed for want of a sign-in: unless `auth status` says otherwise, stop collecting.
+              if ((await signIn().catch(() => "unknown")) !== "ok") {
+                signedOut();
+                why = signedOutText();
+                state.lastError = why;
+              }
+            }
+            // Tell them rather than leave them waiting; the message isn't retried. `failed`: Mnemio doesn't take it for
+            // an answer (a briefing isn't sent as one, nothing is saved to memory).
+            await callMnemio(`inbox/${encodeURIComponent(m.id)}/reply`, { text: `_Your Claude couldn't answer this: ${why}_`, failed: true, ...(e.steps?.length && { steps: e.steps }) }, { env, request }).catch(() => {});
+          } finally {
+            state.busy = false;
+          }
+        }
+        save();
+      } catch (e) {
+        state.lastError = e.message;
+        save();
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, 60000);
+      }
+      if (once) return state;
+    }
+  } finally {
+    stop();
   }
 }
 
@@ -521,25 +702,36 @@ await run();
   return launcher;
 }
 
-function findClaude(env) {
+/** The `claude` command (Claude Code, installed on its own), else Claude Desktop's (desktopClaude). */
+function findClaude(env, { desktop = desktopClaude } = {}) {
   if (env.MNEMIO_CLAUDE_BIN) return env.MNEMIO_CLAUDE_BIN;
   try {
-    return execFileSync(env.SHELL || "/bin/sh", ["-lc", "command -v claude"], { encoding: "utf8" }).trim().split("\n").pop();
-  } catch {
-    return null;
-  }
+    const found = execFileSync(env.SHELL || "/bin/sh", ["-lc", "command -v claude"], { encoding: "utf8" }).trim().split("\n").pop();
+    if (found) return found;
+  } catch {}
+  return desktop();
+}
+
+/**
+ * The environment the service runs with: only these, nothing else from the shell it was set up in (an
+ * ANTHROPIC_API_KEY exported in a shell profile, say, isn't there). USER and LOGNAME too: on a Mac, Claude Code finds
+ * its sign-in in the Keychain under USER, and without it says "Not logged in".
+ */
+export function serviceEnv(claude, env = process.env, node = process.execPath, user = userInfo().username) {
+  const path = [...new Set([dirname(claude), dirname(node), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
+  return { HOME: homedir(), USER: user, LOGNAME: user, PATH: path, ...(env.MNEMIO_CONFIG_DIR && { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }), ...(env.CLAUDE_CONFIG_DIR && { CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR }) };
 }
 
 export function install({ env = process.env, dryRun = env.MNEMIO_LISTENER_DRY_RUN === "1", exec = execFileSync } = {}) {
   const claude = findClaude(env);
-  if (!claude) throw new Error("Couldn't find the claude command. Install Claude Code, then run this again.");
+  if (!claude) throw new Error("Couldn't find Claude Code on this computer (the claude command, or Claude Desktop's). Install Claude Code, sign in, then run this again.");
   const node = process.execPath;
-  const path = [...new Set([dirname(claude), dirname(node), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
+  const extraEnv = serviceEnv(claude, env, node);
+  const path = extraEnv.PATH;
   mkdirSync(listenerDir(env), { recursive: true, mode: 0o700 });
   writeJson(configPath(env), { claude, node, path, installedAt: new Date().toISOString() });
   const launcher = writeLauncher(env);
   const log = join(listenerDir(env), "listener.log");
-  const extraEnv = { HOME: homedir(), PATH: path, ...(env.MNEMIO_CONFIG_DIR && { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }), ...(env.CLAUDE_CONFIG_DIR && { CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR }) };
 
   if (process.platform === "darwin") {
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -608,22 +800,57 @@ export function uninstall({ env = process.env, exec = execFileSync } = {}) {
 export function status({ env = process.env } = {}) {
   const installed = (process.platform === "darwin" && existsSync(plistPath())) || (process.platform === "linux" && existsSync(unitPath()));
   const s = readJson(statePath(env), null);
-  const recent = !!s?.lastPollAt && Date.now() - Date.parse(s.lastPollAt) < 90_000;
-  return { installed, running: recent, answered: s?.answered ?? 0, lastError: s?.lastError ?? null, log: join(listenerDir(env), "listener.log") };
+  // The heartbeat, not the last poll: a listener answering a long message is still running.
+  const recent = at => !!at && Date.now() - Date.parse(at) < 90_000;
+  return { installed, running: recent(s?.heartbeatAt) || recent(s?.lastPollAt), busy: !!s?.busy, claude: s?.claude ?? "unknown", answered: s?.answered ?? 0, lastError: s?.lastError ?? null, log: join(listenerDir(env), "listener.log") };
+}
+
+/**
+ * What /mnemio:connect looks at before offering the listener: whether it can run here (macOS or Linux, Node 22+),
+ * which Claude Code it would use, whether that one is signed in, and whether a listener is on already.
+ */
+export async function check({ env = process.env, platform = process.platform, node = process.versions.node, desktop = desktopClaude, signIn = claudeSignIn } = {}) {
+  const claude = findClaude(env, { desktop });
+  const s = status({ env });
+  return {
+    supported: ["darwin", "linux"].includes(platform),
+    node,
+    nodeOk: Number(node.split(".")[0]) >= 22,
+    claude,
+    claudeFrom: !claude ? null : claude === desktop() ? "claude-desktop" : "claude-code",
+    // As the service will see it, not as this shell does.
+    signedIn: claude ? await signIn({ claude, env: serviceEnv(claude, env) }) : "unknown",
+    listener: { installed: s.installed, running: s.running }
+  };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const action = process.argv[2] || "run";
   try {
     if (action === "run") await run();
-    else {
+    else if (action === "check") console.log(JSON.stringify(await check()));
+    else if (action === "skip") {
+      // They said no to the listener: Settings says so instead of waiting for one.
+      console.log(JSON.stringify({ installed: false, skipped: true, told: await reportSetup("skipped") }));
+    } else {
       const r = action === "install" ? install() : action === "uninstall" ? uninstall() : action === "status" ? status() : null;
-      if (!r) throw new Error("Use install, uninstall, status or run.");
-      if (action === "install") console.log(`  Your Claude now answers your chats on this computer, in the background (log: ${r.log}).`);
-      else console.log(JSON.stringify(r));
+      if (!r) throw new Error("Use install, uninstall, status, check, skip or run.");
+      if (action === "install") {
+        await reportSetup("installed");
+        const signedIn = await claudeSignIn();
+        console.log(`  Your Claude now answers your chats on this computer, in the background (log: ${r.log}).`);
+        if (signedIn === "signed_out") console.log(`  Claude Code may be signed out on this computer; if so, Mnemio → Settings → Claude says so after its test message.`);
+      } else if (action === "uninstall") {
+        await reportSetup("off");
+        console.log(JSON.stringify(r));
+      } else console.log(JSON.stringify(r));
     }
   } catch (e) {
     console.error("Mnemio listener:", e.message);
+    if (action === "install") await reportSetup("failed", e.message);
     process.exitCode = 1;
+  } finally {
+    // They answered the question about the listener (even if starting it failed: Settings says why), so it isn't asked again.
+    if (["install", "skip", "uninstall"].includes(action)) try { forgetListenerOffer(); } catch {}
   }
 }

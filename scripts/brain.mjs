@@ -1,5 +1,6 @@
 import { pathToFileURL } from "node:url";
 import { run } from "./lib/commands.mjs";
+import { nodeTooOld } from "./lib/connect.mjs";
 export { run };
 
 const STDIN_LIMITS = { skill: 8192, recall: 8192, save: 8192, reply: 32768, tool: 65536 };
@@ -10,6 +11,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const files = [];
   for (let i = 0; i < rest.length; i++) if (rest[i] === "--file" && rest[i + 1]) files.push(rest[++i]);
   try {
+    // First: an old Node (no global fetch before 18) would otherwise fail below with "fetch is not defined".
+    const old = nodeTooOld();
+    if (old) throw new Error(old);
     // `skill <name>` may name the skill as an argument; everything else that takes text reads it from stdin.
     let input = action === "skill" && arg ? arg : "";
     if (action in STDIN_LIMITS && !input) {

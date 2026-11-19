@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { hostname } from "node:os";
-import { forgetCredentials, forgetPending, readCredentials, readPending, saveCredentials, savePending } from "./credentials.mjs";
+import { forgetCredentials, forgetListenerOffer, forgetPending, readCredentials, readPending, saveCredentials, savePending } from "./credentials.mjs";
 import { removeSkills } from "./skills-install.mjs";
 
 /**
@@ -44,7 +44,14 @@ async function post(base, path, body, request) {
   return { status: r.status, data };
 }
 
-export async function connect(input, { env = process.env, request = fetch, sleep = ms => new Promise(r => setTimeout(r, ms)), waitMs = 270000, log = m => process.stderr.write(m + "\n") } = {}) {
+/** Why this Node.js is too old for the plugin (its hooks and the listener need 22+), or null. */
+export const nodeTooOld = (node = process.versions.node) =>
+  Number(node.split(".")[0]) < 22 ? `Mnemio needs Node.js 22 or newer, and this computer has ${node}. Install it from nodejs.org, then run /mnemio:connect again.` : null;
+
+export async function connect(input, { env = process.env, request = fetch, sleep = ms => new Promise(r => setTimeout(r, ms)), waitMs = 270000, log = m => process.stderr.write(m + "\n"), node = process.versions.node } = {}) {
+  // Before any code is shown.
+  const old = nodeTooOld(node);
+  if (old) throw new Error(old);
   const url = workspaceUrl(input) || workspaceUrl(env.MNEMIO_URL) || readCredentials(env)?.url || readPending(env)?.url;
   if (!url) throw new Error("Which Mnemio workspace? Run /mnemio:connect with its address, for example /mnemio:connect acme.mnemio.ai.");
 
@@ -63,7 +70,8 @@ export async function connect(input, { env = process.env, request = fetch, sleep
   if (!waitMs) return { approve: pending.link, code: pending.userCode, workspace: pending.workspace, expiresAt: pending.expiresAt };
 
   const deadline = Date.now() + waitMs;
-  while (Date.now() < deadline) {
+  // At least one look, however short the wait.
+  do {
     const { status, data } = await post(url, "/api/claude/connect/poll", { device_code: pending.deviceCode }, request);
     if (data.status === "approved" && data.token) {
       saveCredentials({ url: data.url ? workspaceUrl(data.url) : url, token: data.token, workspace: data.workspace || pending.workspace, connectedAt: new Date().toISOString() }, env);
@@ -76,7 +84,7 @@ export async function connect(input, { env = process.env, request = fetch, sleep
     }
     if (status !== 200) throw new Error(data.error || `The workspace answered ${status}.`);
     await sleep((data.interval || pending.interval) * 1000);
-  }
+  } while (Date.now() < deadline);
   return { waiting: true, code: pending.userCode, link: pending.link, message: "Still waiting for approval. Approve it in the browser, then run /mnemio:connect again to finish." };
 }
 
@@ -84,6 +92,7 @@ export async function connect(input, { env = process.env, request = fetch, sleep
 export async function disconnect({ env = process.env, request = fetch } = {}) {
   const c = readCredentials(env);
   forgetPending(env);
+  forgetListenerOffer(env);
   if (!c) return { disconnected: false, message: "This computer isn't connected to Mnemio." };
   try {
     await request(new URL("/api/claude/config/token", c.url), { method: "DELETE", headers: { authorization: "Bearer " + c.token }, redirect: "error", signal: AbortSignal.timeout(15000) });

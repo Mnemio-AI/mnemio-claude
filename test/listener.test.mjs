@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { answerOne, claudeArgs, install, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, runClaude, shortName, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
+import { answerOne, check, claudeArgs, claudeProbe, probeArgs, claudeSignIn, desktopClaude, install, listenerSettings, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, reportSetup, runClaude, serviceEnv, shortName, startHeartbeat, status, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
 import { readCredentials } from "../scripts/lib/credentials.mjs";
@@ -120,11 +120,11 @@ test("the loop tells the person when their Claude couldn't answer, and waits for
     return Response.json({ delivered: "reply" });
   };
   const broken = fakeClaude(() => ({ type: "result", subtype: "error_during_execution", is_error: true, result: "Not logged in" }));
-  const state = await run({ env, request, spawnFn: broken.spawnFn, once: true });
+  const state = await run({ env, request, spawnFn: broken.spawnFn, once: true, signIn: async () => "ok" });
   assert.match(sent[0].text, /couldn't answer this: Not logged in/);
   assert.equal(state.lastError, "Not logged in");
 
-  const nobody = await run({ env: { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }, request, once: true });
+  const nobody = await run({ env: { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }, request, once: true, signIn: async () => "ok" });
   assert.match(nobody.lastError, /mnemio:connect/);
 });
 
@@ -401,7 +401,7 @@ test("a failed answer is reported as failed, so Mnemio never takes it for the an
     return Response.json({ delivered: "reply" });
   };
   const broken = fakeClaude(() => null);
-  const state = await run({ env, request, spawnFn: broken.spawnFn, once: true });
+  const state = await run({ env, request, spawnFn: broken.spawnFn, once: true, signIn: async () => "ok" });
   assert.equal(sent[0].failed, true);
   assert.match(sent[0].text, /couldn't answer this: Claude stopped without an answer/);
   assert.match(state.lastError, /exit code 1/);
@@ -467,7 +467,7 @@ test("when Claude stops mid-way, the failure says how its steps ended: unfinishe
     return Response.json({ ok: true });
   };
   const claude = fakeClaude(() => [toolUse("t1", "mcp__plugin_mnemio_mnemio__list_goals", {}), toolResult("t1"), toolUse("t2", "Read", { file_path: "/x/a.pdf" })]);
-  await run({ env, request, spawnFn: claude.spawnFn, once: true });
+  await run({ env, request, spawnFn: claude.spawnFn, once: true, signIn: async () => "ok" });
   const failure = sent.find(s => s.path.endsWith("/reply")).body;
   assert.equal(failure.failed, true);
   assert.deepEqual(failure.steps, [{ step: "t2", state: "failed" }], "the cut-off step is failed; the finished one was already confirmed");
@@ -491,7 +491,7 @@ test("where the company manages Claude Code's MCP servers, the listener takes no
   const managed = join(env.MNEMIO_CONFIG_DIR, "managed-mcp.json");
   require("node:fs").writeFileSync(managed, "{}");
   const request = async () => assert.fail("no message is collected");
-  const state = await run({ env, request, once: true, managedPaths: [managed] });
+  const state = await run({ env, request, once: true, signIn: async () => "ok", managedPaths: [managed] });
   assert.match(state.lastError, /company manages Claude Code's MCP servers/);
 });
 
@@ -508,4 +508,187 @@ test("a first attempt's unfinished steps end as failed even when the retry answe
   const answer = calls.find(c => c.path.endsWith("/reply")).body;
   assert.deepEqual(answer.steps, [{ step: "t1", state: "failed" }]);
   assert.ok(!calls.some(c => c.path.endsWith("/progress") && c.body.step === ""), "a step without an id isn't reported");
+});
+
+test("signed out of Claude Code: the person is told so, and the listener collects nothing until they sign in again", async t => {
+  const env = await home(t);
+  const sent = [];
+  let polls = 0;
+  const request = async (url, opts) => {
+    if (url.pathname.endsWith("/next")) {
+      polls++;
+      return Response.json(message("7d0c8a5e-0000-4000-8000-0000000000f1", "Hi"));
+    }
+    sent.push(JSON.parse(opts.body));
+    return Response.json({ delivered: "reply" });
+  };
+  const broken = fakeClaude(() => ({ type: "result", subtype: "error_during_execution", is_error: true, result: "Invalid API key · Please run /login" }));
+  let signedIn = "ok";
+  const signIn = async () => signedIn;
+  // It says "ok" at the start; the answer fails for want of a sign-in, and the check then says so.
+  const first = run({ env, request, spawnFn: broken.spawnFn, once: true, signIn: async () => { const s = signedIn; signedIn = "signed_out"; return s; } });
+  const state = await first;
+  assert.equal(state.claude, "signed_out");
+  assert.match(sent[0].text, /signed out on .+ Open Claude Code there and sign in again/);
+  assert.equal(sent[0].failed, true);
+  // Still signed out, even after a restart: nothing is collected (the message would only fail), and Claude isn't
+  // tried again yet.
+  let probes = 0;
+  const probe = async () => { probes++; return "signed_out"; };
+  const idle = await run({ env, request, once: true, signIn, probe });
+  assert.equal(polls, 1);
+  assert.equal(probes, 0);
+  assert.match(idle.lastError, /signed out/);
+  // Ten minutes on, Claude itself is tried, since `auth status` can be wrong: it answers, so collecting starts again.
+  const stateFile = join(listenerDir(env), "state.json");
+  const saved = JSON.parse(await readFile(stateFile, "utf8"));
+  const elevenAgo = new Date(Date.now() - 11 * 60_000).toISOString();
+  await writeFile(stateFile, JSON.stringify({ ...saved, signedOutAt: elevenAgo, probedAt: elevenAgo }));
+  const working = fakeClaude(() => ({ type: "result", subtype: "success", is_error: false, result: "Hello" }));
+  const back = await run({ env, request, spawnFn: working.spawnFn, once: true, signIn, probe: async () => { probes++; return "ok"; } });
+  assert.equal(probes, 1);
+  assert.equal(back.claude, "ok");
+  assert.equal(polls, 2);
+  assert.doesNotMatch(back.lastError ?? "", /signed out/, "the sign-out error goes once Claude answers again");
+  // An inconclusive try is remembered across a restart: no new try at once.
+  await writeFile(stateFile, JSON.stringify({ ...saved, signedOutAt: new Date(Date.now() - 30 * 60_000).toISOString(), probedAt: new Date().toISOString() }));
+  await run({ env, request, once: true, signIn, probe: async () => assert.fail("tried again at once") });
+  // An error that isn't about signing in is passed on as it is.
+  signedIn = "ok";
+  const other = fakeClaude(() => ({ type: "result", subtype: "error_max_turns", is_error: true, result: "Too many turns" }));
+  await run({ env, request, spawnFn: other.spawnFn, once: true, signIn });
+  assert.match(sent.at(-1).text, /couldn't answer this: Too many turns/);
+});
+
+test("claude auth status: signed in, signed out (even with a failing exit), or unknown on an older Claude Code", async () => {
+  const settings = { claude: "/bin/claude", env: {} };
+  const reply = (err, stdout) => ({ execFn: (bin, args, opts, cb) => { assert.deepEqual(args, ["auth", "status", "--json"]); cb(err, stdout); } });
+  assert.equal(await claudeSignIn(settings, reply(null, JSON.stringify({ loggedIn: true, email: "a@b.c" }))), "ok");
+  assert.equal(await claudeSignIn(settings, reply(Object.assign(new Error("exit 1"), { code: 1 }), JSON.stringify({ loggedIn: false }))), "signed_out");
+  assert.equal(await claudeSignIn(settings, reply(new Error("unknown command 'auth'"), "")), "unknown");
+});
+
+test("the heartbeat goes out on its own, while an answer is still being worked on, and says how the listener is", async t => {
+  const env = await home(t);
+  const beats = [];
+  const request = async (url, opts) => {
+    assert.equal(url.pathname, "/api/claude/listener/heartbeat");
+    beats.push(JSON.parse(opts.body));
+    return Response.json({ ok: true, every: 30 });
+  };
+  const state = { claude: "ok", busy: true, lastError: null };
+  const stop = startHeartbeat(state, { env, request, every: 20, version: "9.9.9" });
+  await new Promise(r => setTimeout(r, 70));
+  stop();
+  assert.ok(beats.length >= 3, `beats: ${beats.length}`);
+  assert.deepEqual(beats[0], { version: "9.9.9", claude: "ok", busy: true, error: null });
+  const n = beats.length;
+  await new Promise(r => setTimeout(r, 40));
+  assert.equal(beats.length, n, "stopped");
+  // The local status goes by the heartbeat too: busy for minutes, still running.
+  assert.deepEqual([status({ env }).running, status({ env }).busy], [true, true]);
+});
+
+test("setting the listener up is reported to Mnemio, and a failure says what went wrong", async t => {
+  const env = await home(t);
+  const sent = [];
+  const request = async (url, opts) => {
+    sent.push({ path: url.pathname, body: JSON.parse(opts.body) });
+    return Response.json({ ok: true });
+  };
+  assert.equal(await reportSetup("installed", undefined, { env, request }), true);
+  await reportSetup("failed", "Couldn't find the claude command.", { env, request });
+  assert.deepEqual(sent, [{ path: "/api/claude/listener/setup", body: { install: "installed" } }, { path: "/api/claude/listener/setup", body: { install: "failed", error: "Couldn't find the claude command." } }]);
+  assert.equal(await reportSetup("off", undefined, { env, request: async () => { throw new Error("offline"); } }), false, "says when Mnemio didn't get it");
+});
+
+/** A fake Claude Desktop folder with these versions of its Claude Code (each in a build folder). */
+async function desktopHome(t, versions) {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "mnemio-desktop-")));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const v of versions) {
+    const bin = join(dir, "Library/Application Support/Claude/claude-code", v, "b0", "claude.app/Contents/MacOS");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, "claude"), "#!/bin/sh\n");
+    await chmod(join(bin, "claude"), 0o755);
+  }
+  return dir;
+}
+
+test("on a Mac with only Claude Desktop, the listener uses Desktop's Claude Code, the newest one", async t => {
+  const home = await desktopHome(t, ["2.1.9", "2.1.325", "2.1.40"]);
+  const bin = desktopClaude({ home, platform: "darwin" });
+  assert.match(bin, /claude-code\/2\.1\.325\/b0\/claude\.app\/Contents\/MacOS\/claude$/);
+  assert.equal(desktopClaude({ home, platform: "linux" }), null);
+  assert.equal(desktopClaude({ home: join(home, "nowhere"), platform: "darwin" }), null);
+});
+
+test("when Claude Desktop updates and the saved Claude Code is gone, the listener finds the new one", async t => {
+  const env = await home(t);
+  delete env.MNEMIO_CLAUDE_BIN;
+  await mkdir(listenerDir(env), { recursive: true });
+  const gone = "/Users/asha/Library/Application Support/Claude/claude-code/2.1.9/b0/claude.app/Contents/MacOS/claude";
+  await writeFile(join(listenerDir(env), "listener.json"), JSON.stringify({ claude: gone, path: "/usr/bin" }));
+  assert.equal(listenerSettings(env, { desktop: () => "/new/claude" }).claude, "/new/claude");
+  // A command chosen on purpose (a wrapper with its own settings, say) that went away isn't swapped for Desktop's.
+  await writeFile(join(listenerDir(env), "listener.json"), JSON.stringify({ claude: "/opt/acme/claude-wrapper" }));
+  assert.equal(listenerSettings(env, { desktop: () => "/new/claude" }).claude, "/opt/acme/claude-wrapper");
+  // Still there (or a bare command name): kept as it is.
+  await writeFile(join(listenerDir(env), "listener.json"), JSON.stringify({ claude: process.execPath }));
+  assert.equal(listenerSettings(env, { desktop: () => "/new/claude" }).claude, process.execPath);
+  await writeFile(join(listenerDir(env), "listener.json"), JSON.stringify({ claude: "claude" }));
+  assert.equal(listenerSettings(env, { desktop: () => "/new/claude" }).claude, "claude");
+});
+
+test("check says what /mnemio:connect needs to know before offering the listener", async t => {
+  const env = await home(t);
+  const seen = [];
+  const signIn = async s => { seen.push(s.claude); assert.equal(s.env.ANTHROPIC_API_KEY, undefined, "checked as the service will run, without the shell's key"); return "signed_out"; };
+  const r = await check({ env: { ...env, ANTHROPIC_API_KEY: "sk-shell-only" }, platform: "darwin", node: "22.3.0", desktop: () => null, signIn });
+  assert.deepEqual({ ...r, listener: undefined }, { supported: true, node: "22.3.0", nodeOk: true, claude: "/usr/local/bin/claude", claudeFrom: "claude-code", signedIn: "signed_out", listener: undefined });
+  assert.deepEqual(seen, ["/usr/local/bin/claude"]);
+  assert.equal(typeof r.listener.installed, "boolean");
+  const old = await check({ env, platform: "win32", node: "20.11.1", desktop: () => null, signIn });
+  assert.equal(old.supported, false);
+  assert.equal(old.nodeOk, false);
+  // Claude Desktop's own Claude Code is said to be that.
+  const desk = await check({ env: { ...env, MNEMIO_CLAUDE_BIN: "/d/claude" }, platform: "darwin", desktop: () => "/d/claude", signIn: async () => "ok" });
+  assert.equal(desk.claudeFrom, "claude-desktop");
+});
+
+test("claude auth status alone saying signed out never stops a listener: it can be wrong while Claude answers", async t => {
+  const env = await home(t);
+  let polls = 0;
+  const request = async (url) => {
+    if (url.pathname.endsWith("/next")) { polls++; return new Response(null, { status: 204 }); }
+    return Response.json({ ok: true });
+  };
+  const state = await run({ env, request, once: true, signIn: async () => "signed_out", probe: async () => assert.fail("not probed") });
+  assert.equal(polls, 1, "it still collects");
+  assert.equal(state.claude, "unknown");
+});
+
+test("the probe asks Claude itself, and tells a missing sign-in from other trouble", async t => {
+  const env = await home(t);
+  const answers = [[null, "OK", ""], [Object.assign(new Error("exit 1"), { code: 1 }), "", "Invalid API key · Please run /login"], [Object.assign(new Error("exit 1"), { code: 1 }), "", "network down"]];
+  const seen = [];
+  const execFn = (bin, args, opts, cb) => { seen.push({ bin, args, cwd: opts.cwd, listener: opts.env.MNEMIO_LISTENER }); const [e, out, err] = answers.shift(); cb(e, out, err); };
+  const settings = { claude: "/usr/local/bin/claude", env: { PATH: "/usr/bin" } };
+  assert.equal(await claudeProbe(settings, { cwd: workDir(env), execFn }), "ok");
+  assert.equal(await claudeProbe(settings, { cwd: workDir(env), execFn }), "signed_out");
+  assert.equal(await claudeProbe(settings, { cwd: workDir(env), execFn }), "unknown");
+  assert.deepEqual(seen[0], { bin: "/usr/local/bin/claude", args: probeArgs(), cwd: workDir(env), listener: "1" });
+  // No tools, no MCP servers, no browser; the sign-in options replies use are kept.
+  assert.deepEqual(probeArgs(["--settings", "/x.json"]).slice(4), ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", "--settings", "/x.json"]);
+  await claudeProbe({ ...settings, extraArgs: ["--settings", "/x.json"] }, { cwd: workDir(env), execFn: (b, args, o, cb) => { seen.push(args); cb(null, "OK", ""); } });
+  assert.deepEqual(seen.at(-1).slice(-2), ["--settings", "/x.json"]);
+});
+
+test("the service's Claude gets USER and LOGNAME, so a Mac finds its sign-in in the Keychain, and nothing else from the shell", () => {
+  const e = serviceEnv("/opt/claude/bin/claude", { ANTHROPIC_API_KEY: "sk-shell", MNEMIO_CONFIG_DIR: "/cfg" }, "/opt/node/bin/node", "asha");
+  assert.equal(e.USER, "asha");
+  assert.equal(e.LOGNAME, "asha");
+  assert.equal(e.MNEMIO_CONFIG_DIR, "/cfg");
+  assert.equal(e.ANTHROPIC_API_KEY, undefined);
+  assert.ok(e.PATH.startsWith("/opt/claude/bin:/opt/node/bin:"));
 });
