@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 import { callMnemio, isConnected } from "./lib/http.mjs";
-import { configDir } from "./lib/credentials.mjs";
+import { configDir, forgetListenerOffer } from "./lib/credentials.mjs";
 import { downloadAttachments, LIMITS, replyFiles } from "./lib/attachments.mjs";
 import { describeStep } from "./lib/steps.mjs";
 import { eventFor } from "./channel.mjs";
@@ -848,5 +848,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     console.error("Mnemio listener:", e.message);
     if (action === "install") await reportSetup("failed", e.message);
     process.exitCode = 1;
+  } finally {
+    // They answered the question about the listener (even if starting it failed: Settings says why), so it isn't asked again.
+    if (["install", "skip", "uninstall"].includes(action)) try { forgetListenerOffer(); } catch {}
   }
 }

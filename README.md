@@ -50,7 +50,7 @@ Requires Claude Code and Node.js 22+.
 
 ### For companies: nothing for staff to do
 
-On Claude Team or Enterprise, an Owner can install it for everyone in managed settings: add the marketplace with `extraKnownMarketplaces` (`Mnemio-AI/mnemio-claude`), turn the plugin on with `enabledPlugins` (`"mnemio@mnemio": true`), and set `MNEMIO_URL` to your workspace under `env`. Each person's first Claude Code session then opens the approval page by itself (at most once a day until they approve): they press Approve, and that's it.
+On Claude Team or Enterprise, an Owner can install it for everyone in managed settings: add the marketplace with `extraKnownMarketplaces` (`Mnemio-AI/mnemio-claude`), turn the plugin on with `enabledPlugins` (`"mnemio@mnemio": true`), and set `MNEMIO_URL` to your workspace under `env`. Each person's first Claude Code session then opens the approval page by itself (at most once a day until they approve): they press Approve. Their Claude then asks, once, whether it should answer their chats on that computer in the background, the same question `/mnemio:connect` asks (again the next day if they ignore it, never once they've answered).
 
 ### Scripts and CI
 

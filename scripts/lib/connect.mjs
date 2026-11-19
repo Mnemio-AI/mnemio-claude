@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { hostname } from "node:os";
-import { forgetCredentials, forgetPending, readCredentials, readPending, saveCredentials, savePending } from "./credentials.mjs";
+import { forgetCredentials, forgetListenerOffer, forgetPending, readCredentials, readPending, saveCredentials, savePending } from "./credentials.mjs";
 import { removeSkills } from "./skills-install.mjs";
 
 /**
@@ -91,6 +91,7 @@ export async function connect(input, { env = process.env, request = fetch, sleep
 export async function disconnect({ env = process.env, request = fetch } = {}) {
   const c = readCredentials(env);
   forgetPending(env);
+  forgetListenerOffer(env);
   if (!c) return { disconnected: false, message: "This computer isn't connected to Mnemio." };
   try {
     await request(new URL("/api/claude/config/token", c.url), { method: "DELETE", headers: { authorization: "Bearer " + c.token }, redirect: "error", signal: AbortSignal.timeout(15000) });

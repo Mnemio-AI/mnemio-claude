@@ -1,12 +1,12 @@
 import { homedir } from "node:os";
 import { dirname, basename, delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import { realpath } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { callMnemio, isConnected } from "./lib/http.mjs";
 import { workspaceConfig } from "./lib/config.mjs";
 import { installSkills, removeSkills, skillsInstalled } from "./lib/skills-install.mjs";
 import { connect } from "./lib/connect.mjs";
-import { configDir, readPending } from "./lib/credentials.mjs";
+import { configDir, readListenerOffer, readPending, saveListenerOffer } from "./lib/credentials.mjs";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { run } from "./lib/commands.mjs";
 import { changedSkill, projectSkills, readDocument, syncSkill } from "./lib/project-skills.mjs";
@@ -38,18 +38,50 @@ export async function syncProject(event, env, prefs = null) {
 }
 
 const AUTO_EVERY_MS = 24 * 3_600_000;
+const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** What Claude is told when the company's setup connected this computer: ask the question /mnemio:connect asks. */
+export const listenerOfferText = (root = PLUGIN_ROOT) =>
+  `Mnemio is now connected on this computer (the company set it up), but nobody has asked the user yet whether their Claude ` +
+  `should answer their Mnemio chats here in the background. Once, early in this conversation and without interrupting what ` +
+  `they asked for, follow step 3 of ${join(root, "commands", "connect.md")}, where \${CLAUDE_PLUGIN_ROOT} is ${root}: it checks ` +
+  `this computer, then asks them one short question. Instead of its "go to step 4", tell them in one line that Mnemio → ` +
+  `Settings → Claude shows how it went.`;
+
+/**
+ * The offer above at a session start, while it's unanswered: at most once a day, so an ignored question doesn't come
+ * back every session. Answering it (listener install, skip or uninstall) or disconnecting removes it.
+ */
+function listenerOffer(env) {
+  const offer = readListenerOffer(env);
+  if (!offer || env.MNEMIO_LISTENER === "1" || (offer.shownAt && Date.now() - offer.shownAt < AUTO_EVERY_MS)) return null;
+  try { saveListenerOffer({ ...offer, shownAt: Date.now() }, env); } catch { return null; }
+  return listenerOfferText();
+}
+
+const withContext = (output, text) => {
+  if (!text) return output;
+  const before = output?.hookSpecificOutput?.additionalContext;
+  return { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: before ? `${before}\n\n${text}` : text } };
+};
 
 /**
  * Not connected yet. When the company set the workspace (MNEMIO_URL, e.g. in managed settings), the first session
  * starts connecting by itself: the approval page opens, the person presses Approve, and the background half of this
- * hook finishes it. At most once a day, so an ignored request doesn't keep opening pages.
+ * hook finishes it. At most once a day, so an ignored request doesn't keep opening pages. Connected that way, nobody
+ * was asked about answering chats in the background, so Claude asks next (listenerOffer).
  */
 async function autoConnect(startup, mode, env, request) {
   if (!startup) return;
   const pending = readPending(env);
   if (mode === "reconcile") {
-    if (pending) await connect(undefined, { env, request, waitMs: 170_000, log: () => {} }).catch(() => {});
-    return;
+    if (!pending) return;
+    const done = await connect(undefined, { env, request, waitMs: 170_000, log: () => {} }).catch(() => null);
+    if (!done?.connected) return;
+    try { saveListenerOffer({ connectedAt: new Date().toISOString() }, env); } catch { return; }
+    // An async hook's context reaches Claude at its next turn, if this session is still open; a later session start
+    // asks otherwise, so it isn't marked shown here.
+    return withContext(undefined, listenerOfferText());
   }
   const hint = "The Mnemio plugin is installed but not connected. If the user wants their company brain (memory, skills, Mnemio tools) here, tell them to run /mnemio:connect <their workspace address>.";
   if (!env.MNEMIO_URL) return { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: hint } };
@@ -80,7 +112,12 @@ export async function handle(event, mode, env = process.env, request = fetch) {
   if (startup && mode !== "reconcile") {
     // Installed company skills are already Claude Code skills; the catalog is only for a first session before that.
     const catalog = companySkills && !(await skillsInstalled(env));
-    return run("session-start", "", { ...env, MNEMIO_LOAD_SKILLS: catalog ? "1" : "0" }, request);
+    let output, failure;
+    try { output = await run("session-start", "", { ...env, MNEMIO_LOAD_SKILLS: catalog ? "1" : "0" }, request); } catch (e) { failure = e; }
+    // The question about the listener still reaches Claude when Mnemio is slow to list the skills.
+    const offer = listenerOffer(env);
+    if (failure && !offer) throw failure;
+    return withContext(output, offer);
   }
   const failures = [];
   if (startup && mode === "reconcile") {
