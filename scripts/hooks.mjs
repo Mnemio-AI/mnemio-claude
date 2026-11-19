@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { dirname, basename, delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import { realpath } from "node:fs/promises";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { callMnemio, isConnected } from "./lib/http.mjs";
 import { workspaceConfig } from "./lib/config.mjs";
 import { installSkills, removeSkills, skillsInstalled } from "./lib/skills-install.mjs";
@@ -38,15 +38,19 @@ export async function syncProject(event, env, prefs = null) {
 }
 
 const AUTO_EVERY_MS = 24 * 3_600_000;
-const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-/** What Claude is told when the company's setup connected this computer: ask the question /mnemio:connect asks. */
-export const listenerOfferText = (root = PLUGIN_ROOT) =>
-  `Mnemio is now connected on this computer (the company set it up), but nobody has asked the user yet whether their Claude ` +
+/**
+ * What Claude is told when the company's setup connected this computer: ask the question /mnemio:connect asks. The
+ * answer goes through /mnemio:listen, whose own allowed-tools let it run without permission prompts.
+ */
+export const listenerOfferText = () =>
+  `Mnemio is connected on this computer (the company set it up), but nobody has asked the user yet whether their Claude ` +
   `should answer their Mnemio chats here in the background. Once, early in this conversation and without interrupting what ` +
-  `they asked for, follow step 3 of ${join(root, "commands", "connect.md")}, where \${CLAUDE_PLUGIN_ROOT} is ${root}: it checks ` +
-  `this computer, then asks them one short question. Instead of its "go to step 4", tell them in one line that Mnemio → ` +
-  `Settings → Claude shows how it went.`;
+  `they asked for, ask them in one short question whether their Claude should answer their Mnemio chats (web, Slack, ` +
+  `Discord, WhatsApp, colleague requests) on this computer in the background, with no Claude Code window open; say Mnemio ` +
+  `sends it a test message first and switches their chats to it only once it answers. If yes, run the /mnemio:listen ` +
+  `command (the mnemio:listen skill) with the argument "on". If no, run it with the argument "skip". Either way, tell them ` +
+  `in one line that Mnemio → Settings → Claude shows how it went.`;
 
 /**
  * The offer above at a session start, while it's unanswered: at most once a day, so an ignored question doesn't come
@@ -73,7 +77,7 @@ const withContext = (output, text) => {
  */
 async function autoConnect(startup, mode, env, request) {
   if (!startup) return;
-  const pending = readPending(env);
+  let pending = readPending(env);
   if (mode === "reconcile") {
     if (!pending) return;
     const done = await connect(undefined, { env, request, waitMs: 170_000, log: () => {} }).catch(() => null);
@@ -85,6 +89,17 @@ async function autoConnect(startup, mode, env, request) {
   }
   const hint = "The Mnemio plugin is installed but not connected. If the user wants their company brain (memory, skills, Mnemio tools) here, tell them to run /mnemio:connect <their workspace address>.";
   if (!env.MNEMIO_URL) return { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: hint } };
+  // Approved since the last session (whose background half had stopped): one quick look finishes it here, rather than
+  // asking them to press Approve again.
+  if (pending) {
+    const done = await connect(undefined, { env, request, waitMs: 1, sleep: async () => {}, log: () => {} }).catch(() => null);
+    if (done?.connected) {
+      try { saveListenerOffer({ connectedAt: new Date().toISOString(), shownAt: Date.now() }, env); } catch {}
+      return withContext(undefined, `Mnemio finished connecting this computer: the user approved it in the browser. ${listenerOfferText()}`);
+    }
+    // Denied or expired: it's gone, and a new request waits for the once-a-day turn below.
+    pending = readPending(env);
+  }
   const mark = join(configDir(env), "auto-connect.json");
   let last = 0;
   try { last = JSON.parse(readFileSync(mark, "utf8")).at; } catch {}

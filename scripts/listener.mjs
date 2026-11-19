@@ -1,6 +1,6 @@
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { homedir, hostname, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { StringDecoder } from "node:string_decoder";
@@ -714,11 +714,12 @@ function findClaude(env, { desktop = desktopClaude } = {}) {
 
 /**
  * The environment the service runs with: only these, nothing else from the shell it was set up in (an
- * ANTHROPIC_API_KEY exported in a shell profile, say, isn't there).
+ * ANTHROPIC_API_KEY exported in a shell profile, say, isn't there). USER and LOGNAME too: on a Mac, Claude Code finds
+ * its sign-in in the Keychain under USER, and without it says "Not logged in".
  */
-export function serviceEnv(claude, env = process.env, node = process.execPath) {
+export function serviceEnv(claude, env = process.env, node = process.execPath, user = userInfo().username) {
   const path = [...new Set([dirname(claude), dirname(node), "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])].join(":");
-  return { HOME: homedir(), PATH: path, ...(env.MNEMIO_CONFIG_DIR && { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }), ...(env.CLAUDE_CONFIG_DIR && { CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR }) };
+  return { HOME: homedir(), USER: user, LOGNAME: user, PATH: path, ...(env.MNEMIO_CONFIG_DIR && { MNEMIO_CONFIG_DIR: env.MNEMIO_CONFIG_DIR }), ...(env.CLAUDE_CONFIG_DIR && { CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR }) };
 }
 
 export function install({ env = process.env, dryRun = env.MNEMIO_LISTENER_DRY_RUN === "1", exec = execFileSync } = {}) {

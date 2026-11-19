@@ -50,7 +50,16 @@ Requires Claude Code and Node.js 22+.
 
 ### For companies: nothing for staff to do
 
-On Claude Team or Enterprise, an Owner can install it for everyone in managed settings: add the marketplace with `extraKnownMarketplaces` (`Mnemio-AI/mnemio-claude`), turn the plugin on with `enabledPlugins` (`"mnemio@mnemio": true`), and set `MNEMIO_URL` to your workspace under `env`. Each person's first Claude Code session then opens the approval page by itself (at most once a day until they approve): they press Approve. Their Claude then asks, once, whether it should answer their chats on that computer in the background, the same question `/mnemio:connect` asks (again the next day if they ignore it, never once they've answered).
+On Claude Team or Enterprise, an Owner can install it for everyone in managed settings: add the marketplace with `extraKnownMarketplaces` (`Mnemio-AI/mnemio-claude`), turn the plugin on with `enabledPlugins` (`"mnemio@mnemio": true`), and set `MNEMIO_URL` to your workspace under `env`. Each person's first Claude Code session then opens the approval page by itself (at most once a day until they approve): they press Approve. Their Claude then asks, once, whether it should answer their chats on that computer in the background, the same question `/mnemio:connect` asks (again the next day if they ignore it, never once they've answered). Their answer runs `/mnemio:listen`; Claude Code asks them to allow that skill once, unless you also add `"Skill(mnemio:listen)"` to `permissions.allow` in the same managed settings:
+
+```json
+{
+  "extraKnownMarketplaces": { "mnemio": { "source": { "source": "github", "repo": "Mnemio-AI/mnemio-claude" } } },
+  "enabledPlugins": { "mnemio@mnemio": true },
+  "env": { "MNEMIO_URL": "https://your-workspace.mnemio.ai" },
+  "permissions": { "allow": ["Skill(mnemio:listen)"] }
+}
+```
 
 ### Scripts and CI
 

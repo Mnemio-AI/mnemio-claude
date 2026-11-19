@@ -6,7 +6,7 @@ const require = createRequire(import.meta.url);
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { answerOne, check, claudeArgs, claudeProbe, probeArgs, claudeSignIn, desktopClaude, install, listenerSettings, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, reportSetup, runClaude, shortName, startHeartbeat, status, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
+import { answerOne, check, claudeArgs, claudeProbe, probeArgs, claudeSignIn, desktopClaude, install, listenerSettings, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, reportSetup, runClaude, serviceEnv, shortName, startHeartbeat, status, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
 import { readCredentials } from "../scripts/lib/credentials.mjs";
@@ -682,4 +682,13 @@ test("the probe asks Claude itself, and tells a missing sign-in from other troub
   assert.deepEqual(probeArgs(["--settings", "/x.json"]).slice(4), ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", "--settings", "/x.json"]);
   await claudeProbe({ ...settings, extraArgs: ["--settings", "/x.json"] }, { cwd: workDir(env), execFn: (b, args, o, cb) => { seen.push(args); cb(null, "OK", ""); } });
   assert.deepEqual(seen.at(-1).slice(-2), ["--settings", "/x.json"]);
+});
+
+test("the service's Claude gets USER and LOGNAME, so a Mac finds its sign-in in the Keychain, and nothing else from the shell", () => {
+  const e = serviceEnv("/opt/claude/bin/claude", { ANTHROPIC_API_KEY: "sk-shell", MNEMIO_CONFIG_DIR: "/cfg" }, "/opt/node/bin/node", "asha");
+  assert.equal(e.USER, "asha");
+  assert.equal(e.LOGNAME, "asha");
+  assert.equal(e.MNEMIO_CONFIG_DIR, "/cfg");
+  assert.equal(e.ANTHROPIC_API_KEY, undefined);
+  assert.ok(e.PATH.startsWith("/opt/claude/bin:/opt/node/bin:"));
 });

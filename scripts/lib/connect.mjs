@@ -70,7 +70,8 @@ export async function connect(input, { env = process.env, request = fetch, sleep
   if (!waitMs) return { approve: pending.link, code: pending.userCode, workspace: pending.workspace, expiresAt: pending.expiresAt };
 
   const deadline = Date.now() + waitMs;
-  while (Date.now() < deadline) {
+  // At least one look, however short the wait.
+  do {
     const { status, data } = await post(url, "/api/claude/connect/poll", { device_code: pending.deviceCode }, request);
     if (data.status === "approved" && data.token) {
       saveCredentials({ url: data.url ? workspaceUrl(data.url) : url, token: data.token, workspace: data.workspace || pending.workspace, connectedAt: new Date().toISOString() }, env);
@@ -83,7 +84,7 @@ export async function connect(input, { env = process.env, request = fetch, sleep
     }
     if (status !== 200) throw new Error(data.error || `The workspace answered ${status}.`);
     await sleep((data.interval || pending.interval) * 1000);
-  }
+  } while (Date.now() < deadline);
   return { waiting: true, code: pending.userCode, link: pending.link, message: "Still waiting for approval. Approve it in the browser, then run /mnemio:connect again to finish." };
 }
 
