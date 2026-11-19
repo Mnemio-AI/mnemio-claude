@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { connect, disconnect, workspaceUrl } from "../scripts/lib/connect.mjs";
 import { readCredentials, saveCredentials } from "../scripts/lib/credentials.mjs";
 import { mnemioConfig } from "../scripts/lib/http.mjs";
@@ -150,7 +151,7 @@ test("on a Node.js too old to have fetch, the command says to upgrade instead of
   const old = 'Object.defineProperty(process, "versions", { value: { ...process.versions, node: "16.20.0" } }); delete globalThis.fetch;';
   let out = "";
   try {
-    execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(old)}`, new URL("../scripts/brain.mjs", import.meta.url).pathname, "connect", "acme.mnemio.ai"], { encoding: "utf8", stdio: "pipe", env: { ...process.env, MNEMIO_CONFIG_DIR: tmpdir() } });
+    execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(old)}`, fileURLToPath(new URL("../scripts/brain.mjs", import.meta.url)), "connect", "acme.mnemio.ai"], { encoding: "utf8", stdio: "pipe", env: { ...process.env, MNEMIO_CONFIG_DIR: tmpdir() } });
   } catch (e) {
     out = e.stderr;
   }

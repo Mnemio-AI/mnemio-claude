@@ -6,7 +6,7 @@ const require = createRequire(import.meta.url);
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { answerOne, check, claudeArgs, claudeProbe, claudeSignIn, desktopClaude, install, listenerSettings, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, reportSetup, runClaude, shortName, startHeartbeat, status, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
+import { answerOne, check, claudeArgs, claudeProbe, probeArgs, claudeSignIn, desktopClaude, install, listenerSettings, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, reportSetup, runClaude, shortName, startHeartbeat, status, stepReporter, toolEvents, workDir } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
 import { readCredentials } from "../scripts/lib/credentials.mjs";
@@ -542,12 +542,17 @@ test("signed out of Claude Code: the person is told so, and the listener collect
   // Ten minutes on, Claude itself is tried, since `auth status` can be wrong: it answers, so collecting starts again.
   const stateFile = join(listenerDir(env), "state.json");
   const saved = JSON.parse(await readFile(stateFile, "utf8"));
-  await writeFile(stateFile, JSON.stringify({ ...saved, signedOutAt: new Date(Date.now() - 11 * 60_000).toISOString() }));
+  const elevenAgo = new Date(Date.now() - 11 * 60_000).toISOString();
+  await writeFile(stateFile, JSON.stringify({ ...saved, signedOutAt: elevenAgo, probedAt: elevenAgo }));
   const working = fakeClaude(() => ({ type: "result", subtype: "success", is_error: false, result: "Hello" }));
   const back = await run({ env, request, spawnFn: working.spawnFn, once: true, signIn, probe: async () => { probes++; return "ok"; } });
   assert.equal(probes, 1);
   assert.equal(back.claude, "ok");
   assert.equal(polls, 2);
+  assert.doesNotMatch(back.lastError ?? "", /signed out/, "the sign-out error goes once Claude answers again");
+  // An inconclusive try is remembered across a restart: no new try at once.
+  await writeFile(stateFile, JSON.stringify({ ...saved, signedOutAt: new Date(Date.now() - 30 * 60_000).toISOString(), probedAt: new Date().toISOString() }));
+  await run({ env, request, once: true, signIn, probe: async () => assert.fail("tried again at once") });
   // An error that isn't about signing in is passed on as it is.
   signedIn = "ok";
   const other = fakeClaude(() => ({ type: "result", subtype: "error_max_turns", is_error: true, result: "Too many turns" }));
@@ -672,5 +677,9 @@ test("the probe asks Claude itself, and tells a missing sign-in from other troub
   assert.equal(await claudeProbe(settings, { cwd: workDir(env), execFn }), "ok");
   assert.equal(await claudeProbe(settings, { cwd: workDir(env), execFn }), "signed_out");
   assert.equal(await claudeProbe(settings, { cwd: workDir(env), execFn }), "unknown");
-  assert.deepEqual(seen[0], { bin: "/usr/local/bin/claude", args: ["-p", "Reply with just OK.", "--max-turns", "1"], cwd: workDir(env), listener: "1" });
+  assert.deepEqual(seen[0], { bin: "/usr/local/bin/claude", args: probeArgs(), cwd: workDir(env), listener: "1" });
+  // No tools, no MCP servers, no browser; the sign-in options replies use are kept.
+  assert.deepEqual(probeArgs(["--settings", "/x.json"]).slice(4), ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", "--settings", "/x.json"]);
+  await claudeProbe({ ...settings, extraArgs: ["--settings", "/x.json"] }, { cwd: workDir(env), execFn: (b, args, o, cb) => { seen.push(args); cb(null, "OK", ""); } });
+  assert.deepEqual(seen.at(-1).slice(-2), ["--settings", "/x.json"]);
 });

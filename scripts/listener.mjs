@@ -504,11 +504,20 @@ export function claudeSignIn(settings = listenerSettings(), { execFn = execFile 
   });
 }
 
-/** Whether Claude itself answers: a one-line prompt, as a message would run. Used only while stopped as signed out. */
+/**
+ * Whether Claude itself answers: a one-line prompt with the same sign-in options as a reply (`extraArgs`), but nothing
+ * else: no tools, no MCP servers, no browser, in the listener's own folder. Used only while stopped as signed out.
+ */
+export const probeArgs = (extra = []) => ["-p", "Reply with just OK.", "--max-turns", "1", "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-chrome", ...extra];
+
 export function claudeProbe(settings = listenerSettings(), { cwd = workDir(), execFn = execFile } = {}) {
-  return new Promise(resolve => {
-    mkdirSync(cwd, { recursive: true, mode: 0o700 });
-    execFn(settings.claude, ["-p", "Reply with just OK.", "--max-turns", "1"], { cwd, env: { ...settings.env, MNEMIO_CHANNEL: "", MNEMIO_LISTENER: "1" }, timeout: 120_000 }, (err, stdout, stderr) => {
+  return new Promise((resolve, reject) => {
+    try {
+      realDir(cwd);
+    } catch (e) {
+      return reject(e);
+    }
+    execFn(settings.claude, probeArgs(settings.extraArgs), { cwd, env: { ...settings.env, MNEMIO_CHANNEL: "", MNEMIO_LISTENER: "1" }, timeout: 120_000 }, (err, stdout, stderr) => {
       if (!err) return resolve("ok");
       resolve(SIGNED_OUT.test(`${stdout ?? ""}\n${stderr ?? ""}`) ? "signed_out" : "unknown");
     });
@@ -549,7 +558,7 @@ export async function reportSetup(install, error, { env = process.env, request =
 
 /** The loop the service runs: collect, answer, repeat. `once`: one round, no heartbeat (tests). */
 export async function run({ env = process.env, request = fetch, spawnFn = spawn, sleep = ms => new Promise(r => setTimeout(r, ms)), once = false, managedPaths = managedMcpPaths(), signIn = () => claudeSignIn(listenerSettings(env)), probe = () => claudeProbe(listenerSettings(env), { cwd: workDir(env) }) } = {}) {
-  const state = { pid: process.pid, startedAt: new Date().toISOString(), answered: 0, lastPollAt: null, heartbeatAt: null, lastError: null, claude: "unknown", signedOutAt: null, busy: false };
+  const state = { pid: process.pid, startedAt: new Date().toISOString(), answered: 0, lastPollAt: null, heartbeatAt: null, lastError: null, claude: "unknown", signedOutAt: null, probedAt: null, busy: false };
   const save = () => writeJson(statePath(env), state);
   let checkedAt = 0;
   let probedAt = 0;
@@ -557,14 +566,17 @@ export async function run({ env = process.env, request = fetch, spawnFn = spawn,
   // than spending a message to find out again; Claude itself is tried on the usual schedule.
   const before = readJson(statePath(env), null);
   if (before?.claude === "signed_out" && Date.now() - Date.parse(before.signedOutAt ?? "") < 24 * 3600_000) {
-    Object.assign(state, { claude: "signed_out", signedOutAt: before.signedOutAt });
-    probedAt = Date.parse(before.signedOutAt);
+    Object.assign(state, { claude: "signed_out", signedOutAt: before.signedOutAt, probedAt: before.probedAt ?? before.signedOutAt });
+    probedAt = Date.parse(state.probedAt) || Date.now();
   }
   const signedOut = () => {
-    Object.assign(state, { claude: "signed_out", signedOutAt: new Date().toISOString() });
     probedAt = Date.now();
+    Object.assign(state, { claude: "signed_out", signedOutAt: new Date(probedAt).toISOString(), probedAt: new Date(probedAt).toISOString() });
   };
-  const signedInAgain = () => Object.assign(state, { claude: "ok", signedOutAt: null });
+  const signedInAgain = () => {
+    if (state.claude === "signed_out" && state.lastError === signedOutText()) state.lastError = null;
+    Object.assign(state, { claude: "ok", signedOutAt: null, probedAt: null });
+  };
   /** `auth status` can clear "signed out", never set it (PROBE_MS); while stopped, Claude itself is tried now and then. */
   const checkSignIn = async () => {
     checkedAt = Date.now();
@@ -572,7 +584,10 @@ export async function run({ env = process.env, request = fetch, spawnFn = spawn,
     if (said === "ok") return signedInAgain();
     if (state.claude !== "signed_out") return void (state.claude = "unknown");
     if (Date.now() - probedAt < PROBE_MS) return;
+    // Saved before it starts, so a restart right after doesn't try again at once.
     probedAt = Date.now();
+    state.probedAt = new Date(probedAt).toISOString();
+    save();
     if ((await probe().catch(() => "unknown")) === "ok") signedInAgain();
   };
   save();
