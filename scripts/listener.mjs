@@ -119,7 +119,14 @@ export const managedMcpPaths = () =>
  * everything else even if their settings allow them, `--strict-mcp-config` loads only Mnemio's server, and
  * `--no-chrome` keeps the browser out even where Claude in Chrome is on.
  */
-export function claudeArgs({ sessionId, folder, outbox, extra = [], mcp = mcpConfig() }) {
+/**
+ * A full path as Claude Code's permission rules write it, after the rule's own leading "/": POSIX form, so on Windows
+ * C:\Users\a becomes /c/Users/a (a rule then reads //c/Users/a/...).
+ */
+export const rulePath = (p, platform = process.platform) =>
+  platform === "win32" ? String(p).replace(/^([A-Za-z]):[\\/]/, (_, d) => `/${d.toLowerCase()}/`).replace(/\\/g, "/") : String(p);
+
+export function claudeArgs({ sessionId, folder, outbox, extra = [], mcp = mcpConfig(), platform = process.platform }) {
   return [
     // stream-json (which needs --verbose with -p): each tool use as it happens, for the live steps; the last line is the result.
     "-p", "--output-format", "stream-json", "--verbose",
@@ -128,7 +135,7 @@ export function claudeArgs({ sessionId, folder, outbox, extra = [], mcp = mcpCon
     "--strict-mcp-config", "--mcp-config", mcp, "--no-chrome",
     // An "accept edits" or "bypass permissions" mode in their settings doesn't apply here: only these rules do.
     "--permission-mode", "default",
-    "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", `Read(/${folder}/**)`, `Edit(/${outbox}/**)`,
+    "--allowedTools", "mcp__plugin_mnemio_mnemio", "Skill", `Read(/${rulePath(folder, platform)}/**)`, `Edit(/${rulePath(outbox, platform)}/**)`,
     ...extra
   ];
 }
@@ -157,12 +164,7 @@ export function toolEvents(line) {
 export function runClaude(prompt, { bin, args, cwd, env = process.env, spawnFn = spawn, timeoutMs = CLAUDE_TIMEOUT_MS, onTool }) {
   return new Promise((resolve, reject) => {
     // MNEMIO_LISTENER: the plugin's hooks skip per-prompt recall and saving answers; Mnemio already does both per message.
-    // Windows: an npm-installed claude may be a .cmd launcher, which only runs through the command interpreter.
-    const shim = process.platform === "win32" && /\.(cmd|bat)$/i.test(bin);
-    const childEnv = { ...env, MNEMIO_CHANNEL: "", MNEMIO_LISTENER: "1" };
-    const child = shim
-      ? spawnFn(`"${bin}"`, args.map(a => `"${String(a).replace(/"/g, '\\"')}"`), { cwd, env: childEnv, stdio: ["pipe", "pipe", "pipe"], shell: true })
-      : spawnFn(bin, args, { cwd, env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawnFn(bin, args, { cwd, env: { ...env, MNEMIO_CHANNEL: "", MNEMIO_LISTENER: "1" }, stdio: ["pipe", "pipe", "pipe"] });
     let err = "";
     let result = null;
     let pending = "";
@@ -476,15 +478,18 @@ export async function answerOne(m, { env = process.env, request = fetch, spawnFn
  *  - "fatal": anything else (including taking too long).
  */
 export function failureOf(e, now = Date.now()) {
-  const msg = String(e?.message || e);
-  if (e?.code === "ENOENT" || e?.status === 401 || e?.status === 403 || e?.type === "authentication_error" || e?.type === "permission_error" || SIGNED_OUT.test(msg) || /failed to authenticate|access token is invalid|credit balance is too low/i.test(msg)) return { kind: "signedOut" };
+  // What Claude Code printed on stderr counts too (a sign-in problem may only show there).
+  const msg = `${e?.message || e} ${e?.detail || ""}`;
+  if (e?.code === "ENOENT") return { kind: "fatal", message: "Claude Code isn't where the listener looks for it: run /mnemio:listen on again in Claude Code." };
+  if (e?.status === 401 || e?.status === 403 || e?.type === "authentication_error" || e?.type === "permission_error" || SIGNED_OUT.test(msg) || /failed to authenticate|access token is invalid|credit balance is too low/i.test(msg)) return { kind: "signedOut" };
   if (e?.status === 429 || e?.type === "rate_limit_error" || /usage limit|limit reached|limit will reset|rate.?limit|too many requests|\b429\b/i.test(msg)) {
     // Claude Code says when the limit resets as "…|<unix seconds>" in its limit message.
     const reset = Number(/\|(\d{10})\b/.exec(msg)?.[1]) * 1000;
     const at = reset > now ? ` at ${new Date(reset).toISOString().slice(11, 16)} UTC` : "";
     return { kind: "limit", retryIn: reset > now ? Math.ceil((reset - now) / 1000) + 60 : 15 * 60, message: `Your Claude reached its usage limit; it answers when the limit resets${at}.` };
   }
-  if (e?.status >= 500 || /overloaded|\b5\d\d\b|api error|econnreset|etimedout|enotfound|eai_again|socket hang up|fetch failed|network/i.test(msg)) return { kind: "passing", retryIn: 60 };
+  // Only what waiting can fix: the API overloaded or down, the network. A 400 (a prompt too long, say) isn't.
+  if (e?.status >= 500 || /overloaded|api error: 5\d\d|econnreset|etimedout|enotfound|eai_again|socket hang up|fetch failed|network error/i.test(msg)) return { kind: "passing", retryIn: 60 };
   return { kind: "fatal" };
 }
 
@@ -697,7 +702,7 @@ export async function run({ env = process.env, request = fetch, spawnFn = spawn,
             const retryIn = kind.kind === "signedOut" ? 30 * 60 : kind.kind === "passing" ? kind.retryIn * 2 ** Math.max(0, (m.attempt || 1) - 1) : kind.retryIn;
             const notice = kind.kind === "signedOut" ? why : kind.kind === "limit" ? kind.message : null;
             const back = kind.kind !== "fatal" && (await callMnemio(`inbox/${encodeURIComponent(m.id)}/release`, { retry_in: Math.min(retryIn, 6 * 3600), ...(notice && { notice }) }, { env, request }).then(() => true, () => false));
-            if (!back) await callMnemio(`inbox/${encodeURIComponent(m.id)}/reply`, { text: `_Your Claude couldn't answer this: ${why}_`, failed: true, ...(e.steps?.length && { steps: e.steps }) }, { env, request }).catch(() => {});
+            if (!back) await callMnemio(`inbox/${encodeURIComponent(m.id)}/reply`, { text: `_Your Claude couldn't answer this: ${kind.message || why}_`, failed: true, ...(e.steps?.length && { steps: e.steps }) }, { env, request }).catch(() => {});
           } finally {
             state.busy = false;
           }
@@ -726,7 +731,7 @@ const xml = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(
 function writeLauncher(env) {
   const launcher = join(listenerDir(env), "launch.mjs");
   const pluginsRoot = join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "plugins");
-  const here = new URL(import.meta.url).pathname;
+  const here = fileURLToPath(import.meta.url);
   writeFileSync(launcher, `// Mnemio listener launcher (written by the plugin). Runs the newest installed plugin's listener.
 import { readdirSync, statSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -758,9 +763,12 @@ function findClaude(env, { desktop = desktopClaude, platform = process.platform 
   if (env.MNEMIO_CLAUDE_BIN) return env.MNEMIO_CLAUDE_BIN;
   try {
     if (platform === "win32") {
-      // The native claude.exe if there is one (an npm install also leaves .cmd launchers, which need cmd.exe).
+      // Only Claude Code's own claude.exe: npm's launchers (an extensionless shell script, claude.cmd) can't be started
+      // without cmd.exe, whose quoting the listener won't rely on.
       const all = execFileSync("where.exe", ["claude"], { encoding: "utf8" }).trim().split(/\r?\n/);
-      return all.find(p => /\.exe$/i.test(p)) || all[0];
+      const exe = all.find(p => /\.exe$/i.test(p));
+      if (!exe && all.some(Boolean)) throw new Error("The background listener needs Claude Code's own installer on Windows (claude.exe), not the npm package: see https://code.claude.com/docs/en/setup, then run this again.");
+      return exe || null;
     }
     const found = execFileSync(env.SHELL || "/bin/sh", ["-lc", "command -v claude"], { encoding: "utf8" }).trim().split("\n").pop();
     if (found) return found;
@@ -797,16 +805,42 @@ export function install({ env = process.env, dryRun = env.MNEMIO_LISTENER_DRY_RU
 
   if (platform === "win32") {
     // A small script that keeps the listener running (it waits 30 s and starts it again if it stops), logging to the
-    // listener's log; the task starts it at sign-in, and now.
+    // listener's log, with only these variables set (an API key in the user's environment isn't Claude's sign-in).
+    // A hidden launcher starts it (no console window to close by mistake), and a Task Scheduler task starts that at
+    // sign-in: on battery too, with no time limit.
     const q = v => `"${String(v).replace(/"/g, "")}"`;
-    const script = ["@echo off", ...Object.entries(extraEnv).map(([k, v]) => `set ${q(`${k}=${v}`)}`), ":loop", `${q(node)} ${q(launcher)} >> ${q(log)} 2>&1`, "timeout /t 30 /nobreak > nul", "goto loop", ""].join("\r\n");
+    const clear = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"];
+    const script = ["@echo off", "chcp 65001 >nul", ...clear.map(k => `set "${k}="`), ...Object.entries(extraEnv).map(([k, v]) => `set ${q(`${k}=${v}`)}`), ":loop", `${q(node)} ${q(launcher)} >> ${q(log)} 2>&1`, "ping -n 31 127.0.0.1 >nul", "goto loop", ""].join("\r\n");
+    // UTF-8 with the code page switched first: paths with non-ASCII user names survive.
     writeFileSync(cmdPath(env), script);
-    const args = ["/Create", "/F", "/SC", "ONLOGON", "/RL", "LIMITED", "/TN", TASK, "/TR", `"${cmdPath(env)}"`];
+    const vbs = join(listenerDir(env), "listener.vbs");
+    writeFileSync(vbs, `CreateObject("WScript.Shell").Run """${cmdPath(env).replace(/"/g, "")}""", 0, False\r\n`);
+    const xmlEsc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const who = env.USERDOMAIN && env.USERNAME ? `${env.USERDOMAIN}\\${env.USERNAME}` : env.USERNAME || "";
+    const task = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><LogonTrigger><Enabled>true</Enabled>${who ? `<UserId>${xmlEsc(who)}</UserId>` : ""}</LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Hidden>true</Hidden>
+    <StartWhenAvailable>true</StartWhenAvailable>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>wscript.exe</Command><Arguments>//B "${xmlEsc(vbs)}"</Arguments></Exec></Actions>
+</Task>
+`;
+    const xmlFile = join(listenerDir(env), "listener-task.xml");
+    // Task Scheduler reads its XML as UTF-16.
+    writeFileSync(xmlFile, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(task, "utf16le")]));
+    const args = ["/Create", "/F", "/TN", TASK, "/XML", xmlFile];
     if (!dryRun) {
       exec("schtasks", args, { stdio: "ignore" });
       exec("schtasks", ["/Run", "/TN", TASK], { stdio: "ignore" });
     }
-    return { installed: true, service: cmdPath(env), task: args, log, dryRun };
+    return { installed: true, service: cmdPath(env), task: args, taskXml: xmlFile, log, dryRun };
   }
   if (platform === "darwin") {
     const plist = `<?xml version="1.0" encoding="UTF-8"?>

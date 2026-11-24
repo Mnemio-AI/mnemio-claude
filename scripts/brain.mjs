@@ -12,7 +12,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   let answering;
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === "--file" && rest[i + 1]) files.push(rest[++i]);
-    else if (rest[i] === "--for" && rest[i + 1]) answering = rest[++i];
+    else if (rest[i] === "--for") {
+      if (!rest[i + 1]) { console.error("Mnemio: --for takes the id of the message you're answering."); process.exit(1); }
+      answering = rest[++i];
+    }
   }
   try {
     // First: an old Node (no global fetch before 18) would otherwise fail below with "fetch is not defined".

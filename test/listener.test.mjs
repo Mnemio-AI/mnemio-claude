@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { rulePath } from "../scripts/listener.mjs";
 import { answerOne, check, claudeArgs, claudeProbe, probeArgs, claudeSignIn, desktopClaude, install, listenerSettings, listenerDir, mcpConfig, messageFolder, openFence, outboxFiles, replyText, run, reportSetup, runClaude, serviceEnv, shortName, startHeartbeat, status, stepReporter, toolEvents, workDir, failureOf } from "../scripts/listener.mjs";
 import { describeStep } from "../scripts/lib/steps.mjs";
 import { handle } from "../scripts/hooks.mjs";
@@ -734,6 +735,23 @@ test("on Windows, a sign-in task keeps the listener running (dry run: nothing sc
   const env = { ...(await home(t)), MNEMIO_LISTENER_DRY_RUN: "1" };
   const r = install({ env, platform: "win32", exec: () => assert.fail("dry run must not touch the system") });
   const script = await readFile(r.service, "utf8");
-  assert.match(script, /:loop\r\n.*launch\.mjs.*listener\.log.*\r\ntimeout \/t 30/);
-  assert.deepEqual(r.task.slice(0, 5), ["/Create", "/F", "/SC", "ONLOGON", "/RL"]);
+  assert.match(script, /^@echo off\r\nchcp 65001 >nul\r\nset "ANTHROPIC_API_KEY="/, "UTF-8 paths, and no API key from the user's environment");
+  assert.match(script, /:loop\r\n.*launch\.mjs.*listener\.log.*\r\nping -n 31 127\.0\.0\.1 >nul\r\ngoto loop/, "a wait that works without a console");
+  assert.deepEqual(r.task.slice(0, 4), ["/Create", "/F", "/TN", "Mnemio listener"]);
+  const xml = (await readFile(r.taskXml)).toString("utf16le");
+  for (const s of ["<DisallowStartIfOnBatteries>false", "<StopIfGoingOnBatteries>false", "<ExecutionTimeLimit>PT0S", "<Hidden>true", "<Command>wscript.exe"]) assert.ok(xml.includes(s), s);
+});
+
+test("on Windows, the folder rules are written the way Claude Code reads Windows paths", () => {
+  assert.equal(rulePath("C:\\Users\\asha\\mnemio\\messages\\m1", "win32"), "/c/Users/asha/mnemio/messages/m1");
+  assert.equal(rulePath("/Users/asha/x", "darwin"), "/Users/asha/x");
+  const args = claudeArgs({ folder: "C:\\a\\m1", outbox: "C:\\a\\m1\\outbox", mcp: "{}", platform: "win32" });
+  assert.ok(args.includes("Read(//c/a/m1/**)") && args.includes("Edit(//c/a/m1/outbox/**)"));
+});
+
+test("a 400 from the API isn't retried; a 5xx or an overloaded API is", () => {
+  assert.equal(failureOf(Object.assign(new Error("API Error: 400 prompt is too long"), { status: 400 })).kind, "fatal");
+  assert.equal(failureOf(new Error("API Error: 503 Service Unavailable")).kind, "passing");
+  assert.equal(failureOf(Object.assign(new Error("odd"), { detail: "Please run /login" })).kind, "signedOut", "stderr counts");
+  assert.equal(failureOf(Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" })).kind, "fatal");
 });

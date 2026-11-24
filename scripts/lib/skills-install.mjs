@@ -64,8 +64,14 @@ export async function installSkills({ env = process.env, request = fetch } = {})
     if (existsSync(dir) && !mine.has(dirName)) { skipped++; continue; }
     const temp = join(root, `.${dirName}.${randomUUID()}.tmp`);
     try {
-      for (const [path, text] of Object.entries(s.files)) {
+      // SKILL.md first, and one file per name whatever its case: on a case-insensitive disk (macOS, Windows) a
+      // "skill.md" would otherwise replace the sanitized SKILL.md with the raw one.
+      const seen = new Set();
+      const entries = Object.entries(s.files).sort(([a], [b]) => (a === "SKILL.md" ? -1 : b === "SKILL.md" ? 1 : 0));
+      for (const [path, text] of entries) {
         if (!MD_PATH.test(path) || path.split("/").includes("..")) continue;
+        if (seen.has(path.toLowerCase())) continue;
+        seen.add(path.toLowerCase());
         const target = join(temp, ...path.split("/"));
         if (!target.startsWith(temp + sep)) continue;
         await mkdir(dirname(target), { recursive: true });

@@ -124,8 +124,10 @@ export function createChannel({ env = process.env, request = fetch, send, sleep 
           send(eventFor(message, files));
           // The next message waits until Claude replies to this one (or a while has passed).
           let timer;
-          await Promise.race([answered, new Promise(r => { timer = setTimeout(r, answerWaitMs); timer.unref?.(); }), new Promise(r => stop.signal.addEventListener("abort", r, { once: true }))]);
+          let onAbort;
+          await Promise.race([answered, new Promise(r => { timer = setTimeout(r, answerWaitMs); timer.unref?.(); }), new Promise(r => { onAbort = r; stop.signal.addEventListener("abort", r, { once: true }); })]);
           clearTimeout(timer);
+          stop.signal.removeEventListener("abort", onAbort);
           current = null;
           delete callEnv.MNEMIO_ANSWERING;
         }

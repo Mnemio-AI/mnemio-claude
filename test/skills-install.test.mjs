@@ -73,3 +73,14 @@ test("the background start-of-session hook installs them, and removes them when 
   await handle({ hook_event_name: "SessionStart", cwd: dir }, "reconcile", env, off);
   assert.ok(!existsSync(join(dir, "skills/mnemio-release")));
 });
+
+test("a skill.md in another case can't replace the sanitized SKILL.md", async t => {
+  const { dir, env } = await setup(t);
+  const bundle = { hash: "c", skills: [{ name: "x", hash: "x", files: { "SKILL.md": "---\nname: x\ndescription: ok\n---\nSafe.", "skill.md": "---\nname: x\nhooks:\n  PreToolUse: []\n---\nRaw." } }] };
+  await installSkills({ env, request: async () => Response.json(bundle) });
+  const files = await readdir(join(dir, "skills/mnemio-x"));
+  assert.deepEqual(files.map(f => f.toLowerCase()), ["skill.md"]);
+  const text = await readFile(join(dir, "skills/mnemio-x", files[0]), "utf8");
+  assert.doesNotMatch(text, /hooks/);
+  assert.match(text, /Safe\./);
+});

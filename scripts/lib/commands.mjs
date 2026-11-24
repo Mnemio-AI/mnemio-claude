@@ -15,7 +15,8 @@ async function mcpCall(rpc, env, request, answering) {
   const { url, token } = mnemioConfig(env);
   const response = await request(new URL("/api/claude/mcp", url), {
     method: "POST",
-    headers: { ...(token && { authorization: "Bearer " + token }), ...(answering && { "x-mnemio-answering": answering }), "content-type": "application/json", accept: "application/json, text/event-stream" },
+    // The message being answered (--for), or, in a session started to listen (channel mode), that it's answering chats.
+    headers: { ...(token && { authorization: "Bearer " + token }), ...((answering || env.MNEMIO_ANSWERING || env.MNEMIO_CHANNEL === "1") && { "x-mnemio-answering": answering || env.MNEMIO_ANSWERING || "channel" }), "content-type": "application/json", accept: "application/json, text/event-stream" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, ...rpc }),
     redirect: "error",
     signal: AbortSignal.timeout(120000)
