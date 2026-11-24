@@ -12,20 +12,25 @@ The plugin talks to Mnemio over HTTPS with its own sign-in; it never sees or sen
 
 ## Set up
 
-**In Mnemio → Settings → Claude, press Connect Claude Code** and paste the command it shows into a terminal:
+You need a Mac or Linux computer with Node.js 22 or newer, and Claude Desktop or Claude Code, signed in. Then, in Claude (Claude Desktop's **Code** tab, in a session in any folder, or `claude` in a terminal), send these one at a time; **Mnemio → Settings → Claude** has them ready to copy:
+
+```
+/plugin marketplace add Mnemio-AI/mnemio-claude
+/plugin install mnemio@mnemio
+/mnemio:connect your-workspace.mnemio.ai
+```
+
+(If Claude doesn't know `/mnemio:connect` yet, send `/reload-plugins` first.) The last one opens your workspace in the browser: check the code and press **Approve**. Your Claude then checks this computer and asks whether it should **answer your chats here in the background**. Mnemio sends it a test message; once it answers, your Mnemio chats switch to your Claude and the Settings page turns green. If the listener couldn't start, or you said no, Settings says so, and your chats stay with your Mnemio assistant. The sign-in is this computer's own, saved privately in `~/.config/mnemio/`.
+
+Answering in the background needs Claude Code's `claude` command; on a Mac with only Claude Desktop, the listener uses the Claude Code inside Claude Desktop (and finds it again after Desktop updates).
+
+Prefer a terminal? Settings → Claude also gives you one command that does all of it (it needs the `claude` command):
 
 ```sh
 curl -fsSL https://your-workspace.mnemio.ai/api/claude/install | sh -s -- <one-time code>
 ```
 
-That's all. It installs this plugin, signs this computer in (its own sign-in, saved privately in `~/.config/mnemio/`), switches your Mnemio chats to your Claude, and asks whether your Claude should **answer your chats on this computer in the background** (yes by default). The Settings page turns green when it's done. The code works once, for 10 minutes, and is never part of a web address (so it can't end up in a proxy's logs); fetching the script alone never uses it.
-
-Already in Claude Code? This does the same, approving in the browser instead:
-
-```
-/plugin install mnemio --marketplace Mnemio-AI/mnemio-claude
-/mnemio:connect your-workspace.mnemio.ai
-```
+The code works once, for 10 minutes; fetching the link alone (a chat app's link preview, say) never uses it.
 
 **Mnemio → Settings → Claude** lists every Claude you connected (sign any one out) and what the plugin does:
 
@@ -45,7 +50,16 @@ Requires Claude Code and Node.js 22+.
 
 ### For companies: nothing for staff to do
 
-On Claude Team or Enterprise, an Owner can install it for everyone in managed settings: add the marketplace with `extraKnownMarketplaces` (`Mnemio-AI/mnemio-claude`), turn the plugin on with `enabledPlugins` (`"mnemio@mnemio": true`), and set `MNEMIO_URL` to your workspace under `env`. Each person's first Claude Code session then opens the approval page by itself (at most once a day until they approve): they press Approve, and that's it.
+On Claude Team or Enterprise, an Owner can install it for everyone in managed settings: add the marketplace with `extraKnownMarketplaces` (`Mnemio-AI/mnemio-claude`), turn the plugin on with `enabledPlugins` (`"mnemio@mnemio": true`), and set `MNEMIO_URL` to your workspace under `env`. Each person's first Claude Code session then opens the approval page by itself (at most once a day until they approve): they press Approve. Their Claude then asks, once, whether it should answer their chats on that computer in the background, the same question `/mnemio:connect` asks (again the next day if they ignore it, never once they've answered). Their answer runs `/mnemio:listen`; Claude Code asks them to allow that skill once, unless you also add `"Skill(mnemio:listen)"` to `permissions.allow` in the same managed settings:
+
+```json
+{
+  "extraKnownMarketplaces": { "mnemio": { "source": { "source": "github", "repo": "Mnemio-AI/mnemio-claude" } } },
+  "enabledPlugins": { "mnemio@mnemio": true },
+  "env": { "MNEMIO_URL": "https://your-workspace.mnemio.ai" },
+  "permissions": { "allow": ["Skill(mnemio:listen)"] }
+}
+```
 
 ### Scripts and CI
 
@@ -57,15 +71,15 @@ Once connected, your Mnemio chats — the web chat, Slack, Discord, WhatsApp, co
 
 ### On your computer: the background listener (recommended)
 
-Turned on by the install command, or with `/mnemio:listen on`. A small background service (a macOS launch agent, a Linux user service, or a Windows sign-in task) collects each message and answers it with `claude -p` — your own Claude Code, signed in with your own plan — keeping one Claude session per conversation. No Claude Code window needs to be open. Up to three conversations are answered at once; messages in one conversation are answered in order. Each conversation is answered in a folder of its own, without your personal Claude Code settings or other MCP servers. Messages can come from shared threads, so Claude only gets what answering needs: Mnemio's tools (memory search and saving included) and company skills, reading the files that came with the message, and writing files it wants to send back into that message's outbox folder (they go with its reply); no shell, no other writing, no web.
+Turned on by the install command, or with `/mnemio:listen on`. A small background service (a macOS launch agent, a Linux user service, or a Windows sign-in task) collects each message and answers it with `claude -p` — your own Claude Code, signed in with your own plan — keeping one Claude session per conversation. No Claude Code window needs to be open. Messages can come from shared threads, so Claude only gets what answering needs: Mnemio's tools and company skills, reading the files that came with the message, and writing files to send you into that message's outbox. Each message's files are in a folder of their own, outside the folder Claude works in, granted to Claude for that message alone and removed once it's answered; no shell, no writing anywhere else, no web, and none of your other MCP servers or connectors — whatever your own Claude Code settings allow. While it works, each step it takes ("Searching memory", "Using mnemio-release-checklist") shows live in your chat, as with Mnemio's own assistant. Steps show only a label, plus a memory search's query or a file's name: never what's being sent or approved.
+
+Besides collecting messages, it sends Mnemio a heartbeat every 30 seconds, so Settings → Claude shows each computer as **Answering** (even in the middle of a long answer), **Offline** (asleep, or not running), or **Sign in to Claude again** (Claude Code was signed out there: the listener takes no messages until you sign in, and they wait for it). `/mnemio:listen status` shows the same here; its log is in `~/.config/mnemio/listener/listener.log`.
 
 If Claude can't answer for a passing reason — your plan's usage limit, Claude Code signed out on that computer, an overloaded API, the network — the message goes back to Mnemio and is answered once the limit resets, you sign in again, or a little later (a few tries at most, then you're told). For a limit or a sign-out you're told right away why it's late, in the chat you asked in.
 
-`/mnemio:listen status` shows whether it's running, and **Mnemio → Settings → Claude** shows it per computer with the last problem; its log is in `~/.config/mnemio/listener/listener.log`.
-
 ### Approval before anything that sends, changes or deletes
 
-While your Claude answers chats (the background listener, a cloud run, or a session started in channel mode), what it reads in a message — a shared thread, a forwarded email — could try to make it act. So Mnemio itself holds every call that sends, changes or deletes: messaging a colleague, a connected system's tool not marked read-only, a connected app's action (sending mail, creating pages). You get an approval card in the web app and your chat apps showing exactly what would happen (a call too long for a chat app's card is decided in the web app, where all of it is shown; one too long to show at all can't be approved); your Claude is told your decision in the same conversation, and the approved call runs once, with exactly those arguments. Reading needs no approval, and Claude Code sessions you work in yourself are not affected.
+While your Claude answers chats (the background listener, a cloud run, or a session started in channel mode), what it reads in a message — a shared thread, a forwarded email — could try to make it act. So Mnemio itself holds every call that sends, changes or deletes: messaging a colleague, a connected system's tool not marked read-only (or whose name says it writes), a connected app's action (sending mail, creating pages). You get an approval card in the web app and your chat apps showing exactly what would happen (a call too long for a chat app's card is decided in the web app, where all of it is shown); your Claude is told your decision in the same conversation, and the approved call runs once, with exactly those arguments. Reading needs no approval, and Claude Code sessions you work in yourself are not affected.
 
 ### In a Claude Code session: channel mode
 

@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { handle, syncProject } from "../scripts/hooks.mjs";
+import { readListenerOffer, saveListenerOffer } from "../scripts/lib/credentials.mjs";
 
 async function setup(t) {
   const cwd = await realpath(await mkdtemp(join(tmpdir(), "mnemio-project-")));
@@ -81,4 +85,79 @@ test("updates the same memory document when Claude edits it", async t => {
   }
   assert.equal(calls[0].data.key, calls[1].data.key);
   assert.deepEqual(calls.map(c => c.data.text), ["Tuesday", "Thursday"]);
+});
+
+test("connected by the company's setup, Claude asks about the background listener until it's answered", async t => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "mnemio-managed-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  // Managed settings give the workspace only; this computer has no sign-in yet. Nothing listens on port 1, so the
+  // listener's own report to Mnemio fails fast.
+  const env = { MNEMIO_URL: "http://localhost:1", MNEMIO_NO_BROWSER: "1", MNEMIO_CONFIG_DIR: join(home, "config"), MNEMIO_SKILLS_DIR: join(home, "skills"), CLAUDE_PLUGIN_DATA: join(home, "data") };
+  const request = async url => {
+    if (url.pathname === "/api/claude/connect/start") return Response.json({ device_code: "d".repeat(43), user_code: "ABCD-EFGH", verification_uri_complete: "http://localhost:1/connect-claude?code=ABCD-EFGH", expires_in: 600, interval: 1, workspace: "Acme" });
+    if (url.pathname === "/api/claude/connect/poll") return Response.json({ status: "approved", token: "t".repeat(40), workspace: "Acme" });
+    if (url.pathname === "/api/claude/config") return Response.json({ workspace: "Acme", prefs: {} });
+    return Response.json({ hash: "none", skills: [] });
+  };
+  const start = mode => handle({ hook_event_name: "SessionStart", cwd: home }, mode, env, request);
+  const context = output => output?.hookSpecificOutput?.additionalContext ?? "";
+  const offer = readListenerOffer;
+  const asks = /answer their Mnemio chats here in the background/;
+
+  assert.match(context(await start()), /press Approve/);
+  assert.equal(offer(env), null, "nothing to ask before the approval");
+  assert.match(context(await start("reconcile")), asks, "the session that connected is asked at its next turn");
+  assert.ok(offer(env).connectedAt && !offer(env).shownAt);
+
+  const first = context(await start());
+  assert.match(first, asks, "and so is the next session");
+  assert.match(first, /\/mnemio:listen command .* "on"\. If no, run it with the argument "skip"/);
+  assert.equal(context(await start()), "", "only once a day");
+  assert.equal(context(await handle({ hook_event_name: "SessionStart", cwd: home }, undefined, { ...env, MNEMIO_LISTENER: "1" }, request)), "", "never in a listener's own run");
+  saveListenerOffer({ ...offer(env), shownAt: Date.now() - 25 * 3_600_000 }, env);
+  assert.match(context(await start()), asks, "an ignored question comes back the next day");
+
+  // Saying no (or yes) answers it for good.
+  await promisify(execFile)(process.execPath, [fileURLToPath(new URL("../scripts/listener.mjs", import.meta.url)), "skip"], { env: { ...process.env, ...env } });
+  assert.equal(offer(env), null);
+  assert.equal(context(await start()), "", "an answered question isn't asked again, even a day later");
+});
+
+test("a computer connected with /mnemio:connect is never asked again at session start", async t => {
+  const { hook, env } = await setup(t);
+  const output = await hook({ hook_event_name: "SessionStart" });
+  assert.doesNotMatch(output?.hookSpecificOutput?.additionalContext ?? "", /in the background/);
+  assert.equal(readListenerOffer(env), null);
+});
+
+test("a session that starts after the approval finishes connecting at once, and a denied request isn't reopened", async t => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "mnemio-approved-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const env = { MNEMIO_URL: "http://localhost:1", MNEMIO_NO_BROWSER: "1", MNEMIO_CONFIG_DIR: join(home, "config"), MNEMIO_SKILLS_DIR: join(home, "skills"), CLAUDE_PLUGIN_DATA: join(home, "data") };
+  let answer = "pending", starts = 0;
+  const request = async url => {
+    if (url.pathname === "/api/claude/connect/start") return starts++, Response.json({ device_code: "d".repeat(43), user_code: "ABCD-EFGH", verification_uri_complete: "http://localhost:1/connect-claude?code=ABCD-EFGH", expires_in: 600, interval: 1, workspace: "Acme" });
+    if (url.pathname === "/api/claude/connect/poll") return answer === "approved" ? Response.json({ status: "approved", token: "t".repeat(40), workspace: "Acme" }) : answer === "denied" ? Response.json({ status: "denied" }, { status: 410 }) : Response.json({ status: "pending", interval: 1 });
+    return Response.json({ workspace: "Acme", prefs: {}, hash: "none", skills: [] });
+  };
+  const start = () => handle({ hook_event_name: "SessionStart", cwd: home }, undefined, env, request);
+  const context = output => output?.hookSpecificOutput?.additionalContext ?? "";
+
+  assert.match(context(await start()), /press Approve/);
+  assert.match(context(await start()), /press Approve/, "still waiting: the same code, not a new one");
+  assert.equal(starts, 1);
+  answer = "approved";
+  const next = context(await start());
+  assert.match(next, /finished connecting this computer/, "approved meanwhile: connected here, not asked to approve again");
+  assert.match(next, /answer their Mnemio chats here in the background/);
+  assert.ok(readListenerOffer(env).shownAt, "asked already, so the next session doesn't ask again today");
+  assert.equal(context(await start()), "");
+
+  // Denied: the request is gone, and no new approval page opens until the once-a-day turn.
+  const other = { ...env, MNEMIO_CONFIG_DIR: join(home, "config-2") };
+  answer = "pending";
+  await handle({ hook_event_name: "SessionStart", cwd: home }, undefined, other, request);
+  answer = "denied";
+  assert.doesNotMatch(context(await handle({ hook_event_name: "SessionStart", cwd: home }, undefined, other, request)), /press Approve/);
+  assert.equal(starts, 2, "no new request right after a denial");
 });

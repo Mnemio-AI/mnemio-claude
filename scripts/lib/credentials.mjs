@@ -41,6 +41,15 @@ export const readPending = (env = process.env) => readJson(file(env, "pending-co
 export const savePending = (value, env = process.env) => writeJson(file(env, "pending-connect.json"), value);
 export const forgetPending = (env = process.env) => rmSync(file(env, "pending-connect.json"), { force: true });
 
+/**
+ * Connected by the company's setup (managed settings) rather than by /mnemio:connect, so nobody has asked yet whether
+ * this computer's Claude answers their chats in the background: { connectedAt, shownAt }. Gone once they answer
+ * (listener install, skip or uninstall) or disconnect.
+ */
+export const readListenerOffer = (env = process.env) => readJson(file(env, "listener-offer.json"));
+export const saveListenerOffer = (value, env = process.env) => writeJson(file(env, "listener-offer.json"), value);
+export const forgetListenerOffer = (env = process.env) => rmSync(file(env, "listener-offer.json"), { force: true });
+
 /** The workspace's settings for the plugin (GET /api/claude/config), cached briefly. */
 export const readConfigCache = (env = process.env) => readJson(file(env, "config-cache.json"));
 export const saveConfigCache = (value, env = process.env) => writeJson(file(env, "config-cache.json"), value);
