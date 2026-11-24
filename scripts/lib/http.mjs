@@ -52,9 +52,9 @@ export async function fetchMnemio(path, { env = process.env, request = fetch, ti
   return response;
 }
 
-export async function callMnemio(path, payload, { env = process.env, request = fetch, timeout = 65000, method, signal } = {}) {
+export async function callMnemio(path, payload, { env = process.env, request = fetch, timeout = 65000, method, signal, headers: extra = {} } = {}) {
   const { url, token } = mnemioConfig(env);
-  const headers = token ? { authorization: "Bearer " + token } : {};
+  const headers = { ...extra, ...(token && { authorization: "Bearer " + token }) };
   const body = payload === undefined ? undefined : JSON.stringify(payload);
   if (body) headers["content-type"] = "application/json";
   const signals = [AbortSignal.timeout(timeout), ...(signal ? [signal] : [])];

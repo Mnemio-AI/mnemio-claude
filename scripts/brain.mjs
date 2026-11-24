@@ -6,9 +6,13 @@ const STDIN_LIMITS = { skill: 8192, recall: 8192, save: 8192, reply: 32768, tool
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [action, arg, ...rest] = process.argv.slice(2);
-  // reply <id> --file <path> --file <path>: files to send with the answer.
+  // reply <id> --file <path> --file <path>: files to send with the answer. tool <name> --for <id>: the message it's for.
   const files = [];
-  for (let i = 0; i < rest.length; i++) if (rest[i] === "--file" && rest[i + 1]) files.push(rest[++i]);
+  let answering;
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--file" && rest[i + 1]) files.push(rest[++i]);
+    else if (rest[i] === "--for" && rest[i + 1]) answering = rest[++i];
+  }
   try {
     // `skill <name>` may name the skill as an argument; everything else that takes text reads it from stdin.
     let input = action === "skill" && arg ? arg : "";
@@ -18,7 +22,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         if (input.length > STDIN_LIMITS[action]) throw new Error("Input too long.");
       }
     }
-    const result = await run(action, input.trim(), process.env, fetch, arg, files);
+    const result = await run(action, input.trim(), process.env, fetch, arg, files, answering);
     if (result) console.log(JSON.stringify(result, null, ["inbox", "tools"].includes(action) ? 2 : 0));
   } catch (error) {
     console.error("Mnemio:", error.message);

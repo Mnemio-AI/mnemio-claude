@@ -33,12 +33,16 @@ async function writeManifest(env, m) {
   await writeFile(manifestPath(env), JSON.stringify(m, null, 2), { mode: 0o600 });
 }
 
-/** SKILL.md's frontmatter names the skill mnemio-<name>, so it can't clash with one of the person's own. */
+/**
+ * A company skill as plain instructions: its frontmatter keeps only a name (mnemio-<name>, so it can't clash with one
+ * of the person's own) and its description. Anything else a teammate's skill could declare — hooks that run
+ * commands, tools it may use without asking, another model — is dropped: a shared skill must not run code here.
+ */
 export function renameSkill(md, name) {
-  const fm = /^---\s*\n([\s\S]*?)\n---/.exec(md);
-  if (!fm) return `---\nname: ${name}\n---\n${md}`;
-  const body = /^name:.*$/m.test(fm[1]) ? fm[1].replace(/^name:.*$/m, `name: ${name}`) : `name: ${name}\n${fm[1]}`;
-  return md.replace(fm[0], `---\n${body}\n---`);
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(md);
+  const body = fm ? md.slice(fm[0].length) : md;
+  const description = fm && /^description:[ \t]*(.*(?:\r?\n[ \t]+.*)*)$/m.exec(fm[1])?.[1]?.replace(/^[>|][-+]?/, "").replace(/\s*\r?\n\s*/g, " ").trim();
+  return `---\nname: ${name}\n${description ? `description: ${JSON.stringify(description.replace(/^["']|["']$/g, ""))}\n` : ""}---\n${body}`;
 }
 
 /** Brings the installed company skills up to date. Returns what changed. */

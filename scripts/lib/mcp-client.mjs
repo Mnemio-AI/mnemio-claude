@@ -22,7 +22,10 @@ export class MnemioMcp {
       accept: "application/json, text/event-stream",
       ...(token && { authorization: "Bearer " + token }),
       ...(this.session && { "mcp-session-id": this.session }),
-      ...(this.protocol && { "mcp-protocol-version": this.protocol })
+      ...(this.protocol && { "mcp-protocol-version": this.protocol }),
+      // The background listener says which chat it's answering, and a session started to listen (channel mode) is
+      // answering chats too: Mnemio then holds calls that send, change or delete until the person approves them.
+      ...((this.env.MNEMIO_ANSWERING || this.env.MNEMIO_CHANNEL === "1") && { "x-mnemio-answering": this.env.MNEMIO_ANSWERING || "channel" })
     };
     const r = await this.request(new URL(this.path, url), { method: "POST", headers, body: JSON.stringify(message), redirect: "error", signal: AbortSignal.timeout(120000) });
     const sid = r.headers.get("mcp-session-id");

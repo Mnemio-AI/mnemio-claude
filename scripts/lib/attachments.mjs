@@ -1,6 +1,6 @@
-import { mkdir, open, realpath, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { constants } from "node:fs";
 import { fetchMnemio } from "./http.mjs";
 
@@ -46,8 +46,10 @@ export async function replyFiles(paths, roots) {
   let total = 0;
   for (const p of paths) {
     if (typeof p !== "string" || !isAbsolute(p)) throw new Error("Give each file as an absolute path.");
-    const real = await realpath(p).catch(() => null);
-    if (!real || real !== p) throw new Error(`${p}: not found, or reached through a link.`);
+    // The folder it's in may be reached through a system link (macOS: /tmp is /private/tmp); the file itself may not be a link.
+    const info0 = await lstat(p).catch(() => null);
+    if (!info0 || info0.isSymbolicLink()) throw new Error(`${p}: not found, or reached through a link.`);
+    const real = join(await realpath(dirname(p)), basename(p));
     const root = realRoots.find(r => real === r || real.startsWith(r + sep));
     if (!root) throw new Error(`${p}: only files in this session's folder or the temp folder can be sent.`);
     if (relative(root, real).split(sep).some(part => part.startsWith("."))) throw new Error(`${p}: hidden files can't be sent.`);

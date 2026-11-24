@@ -6,7 +6,8 @@
       "env": {
         "MNEMIO_URL": "${MNEMIO_URL:-}",
         "MNEMIO_TOKEN": "${MNEMIO_TOKEN:-}",
-        "MNEMIO_CHANNEL": "${MNEMIO_CHANNEL:-}"
+        "MNEMIO_CHANNEL": "${MNEMIO_CHANNEL:-}",
+        "MNEMIO_ANSWERING": "${MNEMIO_ANSWERING:-}"
       }
     }
   }

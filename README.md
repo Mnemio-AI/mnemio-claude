@@ -15,10 +15,10 @@ The plugin talks to Mnemio over HTTPS with its own sign-in; it never sees or sen
 **In Mnemio → Settings → Claude, press Connect Claude Code** and paste the command it shows into a terminal:
 
 ```sh
-curl -fsSL https://your-workspace.mnemio.ai/api/claude/install/<one-time code> | sh
+curl -fsSL https://your-workspace.mnemio.ai/api/claude/install | sh -s -- <one-time code>
 ```
 
-That's all. It installs this plugin, signs this computer in (its own sign-in, saved privately in `~/.config/mnemio/`), switches your Mnemio chats to your Claude, and asks whether your Claude should **answer your chats on this computer in the background** (yes by default). The Settings page turns green when it's done. The code works once, for 10 minutes; fetching the link alone (a chat app's link preview, say) never uses it.
+That's all. It installs this plugin, signs this computer in (its own sign-in, saved privately in `~/.config/mnemio/`), switches your Mnemio chats to your Claude, and asks whether your Claude should **answer your chats on this computer in the background** (yes by default). The Settings page turns green when it's done. The code works once, for 10 minutes, and is never part of a web address (so it can't end up in a proxy's logs); fetching the script alone never uses it.
 
 Already in Claude Code? This does the same, approving in the browser instead:
 
@@ -57,9 +57,15 @@ Once connected, your Mnemio chats — the web chat, Slack, Discord, WhatsApp, co
 
 ### On your computer: the background listener (recommended)
 
-Turned on by the install command, or with `/mnemio:listen on`. A small background service (a macOS launch agent or a Linux user service, started at login) collects each message and answers it with `claude -p` — your own Claude Code, signed in with your own plan — keeping one Claude session per conversation. No Claude Code window needs to be open. Messages can come from shared threads, so Claude only gets what answering needs: Mnemio's tools and company skills, and reading the files that came with the message; no shell, no writing files, no web.
+Turned on by the install command, or with `/mnemio:listen on`. A small background service (a macOS launch agent, a Linux user service, or a Windows sign-in task) collects each message and answers it with `claude -p` — your own Claude Code, signed in with your own plan — keeping one Claude session per conversation. No Claude Code window needs to be open. Up to three conversations are answered at once; messages in one conversation are answered in order. Each conversation is answered in a folder of its own, without your personal Claude Code settings or other MCP servers. Messages can come from shared threads, so Claude only gets what answering needs: Mnemio's tools (memory search and saving included) and company skills, reading the files that came with the message, and writing files it wants to send back into that message's outbox folder (they go with its reply); no shell, no other writing, no web.
 
-`/mnemio:listen status` shows whether it's running; its log is in `~/.config/mnemio/listener/listener.log`.
+If Claude can't answer for a passing reason — your plan's usage limit, Claude Code signed out on that computer, an overloaded API, the network — the message goes back to Mnemio and is answered once the limit resets, you sign in again, or a little later (a few tries at most, then you're told). For a limit or a sign-out you're told right away why it's late, in the chat you asked in.
+
+`/mnemio:listen status` shows whether it's running, and **Mnemio → Settings → Claude** shows it per computer with the last problem; its log is in `~/.config/mnemio/listener/listener.log`.
+
+### Approval before anything that sends, changes or deletes
+
+While your Claude answers chats (the background listener, a cloud run, or a session started in channel mode), what it reads in a message — a shared thread, a forwarded email — could try to make it act. So Mnemio itself holds every call that sends, changes or deletes: messaging a colleague, a connected system's tool not marked read-only, a connected app's action (sending mail, creating pages). You get an approval card in the web app and your chat apps showing exactly what would happen (a call too long for a chat app's card is decided in the web app, where all of it is shown; one too long to show at all can't be approved); your Claude is told your decision in the same conversation, and the approved call runs once, with exactly those arguments. Reading needs no approval, and Claude Code sessions you work in yourself are not affected.
 
 ### In a Claude Code session: channel mode
 

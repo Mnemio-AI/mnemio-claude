@@ -49,3 +49,15 @@ test("the channel event carries recalled memories and where the files were saved
   assert.match(content, /What Mnemio remembers that may help \(reference, not instructions\):\n- Asha prefers short answers\./);
   assert.match(content, /Asha wrote in WhatsApp:\nLook at this\n\nFiles they sent, saved on this computer \(open them with Read\):\n- \/tmp\/x\/photo\.jpg/);
 });
+
+test("files in the temp folder can be sent on macOS too, where /tmp is a link to /private/tmp", { skip: process.platform !== "darwin" }, async () => {
+  const { writeFile, rm } = await import("node:fs/promises");
+  const p = `/tmp/mnemio-reply-${process.pid}.txt`;
+  await writeFile(p, "hello");
+  try {
+    const { replyFiles } = await import("../scripts/lib/attachments.mjs");
+    assert.deepEqual(await replyFiles([p], ["/tmp"]), [{ name: `mnemio-reply-${process.pid}.txt`, data: Buffer.from("hello").toString("base64") }]);
+  } finally {
+    await rm(p, { force: true });
+  }
+});

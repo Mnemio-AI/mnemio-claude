@@ -74,3 +74,28 @@ test("a cloud run collects and answers with the token the proxy adds, never one 
   await assert.rejects(run("reply", "x", cloud, request, "../skills"), /message id/);
   await assert.rejects(run("inbox", "", { MNEMIO_URL: "https://brain.example", MNEMIO_CONFIG_DIR: "/nonexistent-mnemio" }, request), /mnemio:connect/, "locally a sign-in is required");
 });
+
+test("channel mode takes one message at a time, and its tool calls say which one they're for", async t => {
+  const second = { ...message, id: "7d0c8a5e-0000-4000-8000-000000000002", text: "Second" };
+  const queue = [message, second];
+  const seen = [];
+  const { sent, channel } = harness(t, env, async (url, opts) => {
+    if (url.pathname === "/api/claude/inbox/next") return queue.length ? Response.json(queue.shift()) : new Response(null, { status: 204 });
+    if (url.pathname === "/api/claude/mcp") {
+      seen.push(opts.headers["x-mnemio-answering"]);
+      const body = JSON.parse(opts.body);
+      return Response.json({ jsonrpc: "2.0", id: body.id ?? 0, result: body.method === "tools/list" ? { tools: [{ name: "list_goals", inputSchema: { type: "object" } }] } : { content: [] } });
+    }
+    if (url.pathname === "/api/claude/apps/mcp") return Response.json({ error: "off" }, { status: 403 });
+    return Response.json({ delivered: "reply" });
+  });
+  await channel.onMessage({ jsonrpc: "2.0", method: "notifications/initialized" });
+  while (!sent.some(m => m.method === "notifications/claude/channel")) await new Promise(r => setTimeout(r, 5));
+  await new Promise(r => setTimeout(r, 60));
+  assert.equal(sent.filter(m => m.method === "notifications/claude/channel").length, 1, "the second waits for an answer to the first");
+  await channel.onMessage({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "list_goals", arguments: {} } });
+  assert.ok(seen.length && seen.every(h => h === message.id), "Mnemio is told which message the call is for");
+  await channel.onMessage({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "reply", arguments: { chat_id: message.id, text: "Done." } } });
+  while (sent.filter(m => m.method === "notifications/claude/channel").length < 2) await new Promise(r => setTimeout(r, 5));
+  assert.equal(sent.filter(m => m.method === "notifications/claude/channel")[1].params.meta.chat_id, second.id);
+});

@@ -7,12 +7,15 @@ import { realpath } from "node:fs/promises";
 
 const ID = /^[0-9a-f-]{36}$/;
 
-/** One JSON-RPC call to Mnemio's stateless MCP endpoint (it answers with plain JSON). */
-async function mcpCall(rpc, env, request) {
+/**
+ * One JSON-RPC call to Mnemio's stateless MCP endpoint (it answers with plain JSON). `answering`: the inbox message a
+ * cloud run is answering, so an approval's outcome comes back to that conversation.
+ */
+async function mcpCall(rpc, env, request, answering) {
   const { url, token } = mnemioConfig(env);
   const response = await request(new URL("/api/claude/mcp", url), {
     method: "POST",
-    headers: { ...(token && { authorization: "Bearer " + token }), "content-type": "application/json", accept: "application/json, text/event-stream" },
+    headers: { ...(token && { authorization: "Bearer " + token }), ...(answering && { "x-mnemio-answering": answering }), "content-type": "application/json", accept: "application/json, text/event-stream" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, ...rpc }),
     redirect: "error",
     signal: AbortSignal.timeout(120000)
@@ -22,7 +25,7 @@ async function mcpCall(rpc, env, request) {
   return body.result;
 }
 
-export async function run(action, input, env = process.env, request = fetch, arg, files = []) {
+export async function run(action, input, env = process.env, request = fetch, arg, files = [], answering) {
   const startup = action === "session-start";
   if (startup && env.MNEMIO_LOAD_SKILLS !== "1") return;
   let path;
@@ -69,7 +72,8 @@ export async function run(action, input, env = process.env, request = fetch, arg
       if (input) {
         try { args = JSON.parse(input); } catch { throw new Error("The tool's input on stdin must be JSON."); }
       }
-      return mcpCall({ method: "tools/call", params: { name: arg, arguments: args } }, env, request);
+      if (answering !== undefined && !ID.test(answering)) throw new Error("--for takes the id of the message you're answering.");
+      return mcpCall({ method: "tools/call", params: { name: arg, arguments: args } }, env, request, answering);
     }
     // Connecting this computer, and what it syncs.
     case "connect":
